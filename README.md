@@ -168,7 +168,7 @@ Prefix handling preserves existing object keys:
 | `backup/` | `backup//app_2026-09-12T10:00:00.dump` | `backup/app/latest.dump` |
 | Empty | `/app_2026-09-12T10:00:00.dump` | `app/latest.dump` |
 
-Fixed mode verifies versioning before every backup run and rejects disabled, suspended or unverified versioning. S3-compatible providers must support this API and versioned objects. Keep versioning enabled throughout operation; the initial check cannot prevent later administrative changes.
+Fixed mode checks versioning before every backup run and rejects disabled or suspended versioning. If `GetBucketVersioning` returns `AccessDenied` (HTTP 403), it logs a warning to stderr and continues the backup without verifying versioning. Other verification errors stop the backup. When the check is denied, ensure versioning is enabled to retain previous fixed-name backups. S3-compatible providers must support versioned objects. Keep versioning enabled throughout operation; the initial check cannot prevent later administrative changes.
 
 ### Backup retention
 
@@ -192,7 +192,7 @@ In addition to upload permissions and any bucket encryption/KMS permissions, gra
 
 | Operation | Permission |
 | --- | --- |
-| Check versioning for fixed-name backups | `s3:GetBucketVersioning` on the bucket |
+| Check versioning for fixed-name backups | `s3:GetBucketVersioning` on the bucket; `AccessDenied` logs a warning and allows backup to continue |
 | Restore the current object | `s3:GetObject` on backup objects |
 | Restore a specific VersionId | `s3:GetObjectVersion` on backup objects |
 | Find the latest timestamped backup | `s3:ListBucket` on the bucket |

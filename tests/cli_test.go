@@ -124,6 +124,7 @@ type fakeS3 struct {
 	objects       []object
 	versioning    string
 	fail          string
+	failCode      string
 	uploadFailure string
 	pauseMethod   string
 	pauseEntered  chan struct{}
@@ -161,8 +162,12 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		action = "list"
 	}
 	if action == s.fail || (action == "PUT" && s.uploadFailure != "" && strings.Contains(key, s.uploadFailure)) {
+		code := s.failCode
+		if code == "" {
+			code = "AccessDenied"
+		}
 		w.WriteHeader(http.StatusForbidden)
-		io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>Test failure</Message></Error>`)
+		fmt.Fprintf(w, `<Error><Code>%s</Code><Message>Test failure</Message></Error>`, code)
 		return
 	}
 	switch action {
@@ -553,19 +558,44 @@ func TestFixedKeysEncodingEncryptionAndVersionRestore(t *testing.T) {
 }
 
 func TestFixedBackupRequiresEnabledVersioning(t *testing.T) {
-	for _, status := range []string{"", "Suspended", "error"} {
+	for _, status := range []string{"", "Suspended", "SignatureDoesNotMatch"} {
 		t.Run(status, func(t *testing.T) {
 			f := newFixture(t)
 			f.env["POSTGRES_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
 			f.s3.versioning = status
-			if status == "error" {
+			if status == "SignatureDoesNotMatch" {
 				f.s3.fail = "versioning"
+				f.s3.failCode = status
 			}
 			f.run(false, "backup")
 			assertEqual(t, len(f.processes("pg_dump")), 0)
 			assertEqual(t, len(f.s3.calls("PUT")), 0)
 		})
 	}
+}
+
+func TestFixedBackupContinuesWhenVersioningAccessDenied(t *testing.T) {
+	f := newFixture(t)
+	f.env["POSTGRES_DATABASES"], f.env["BACKUP_FILENAME_MODE"] = "app,billing", "fixed"
+	f.s3.fail = "versioning"
+	cmd := f.command("backup")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("backup failed: %v\n%s\n%s", err, &stdout, &stderr)
+	}
+	f.assertClean()
+	for _, want := range []string{"Warning:", "AccessDenied", "Continuing backup", "ensure bucket versioning is Enabled"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q: %s", want, &stderr)
+		}
+	}
+	if !strings.Contains(stdout.String(), "2 succeeded, 0 failed, 0 retention cleanups failed") {
+		t.Errorf("incorrect backup summary: %s", &stdout)
+	}
+	assertEqual(t, len(f.s3.calls("versioning")), 1)
+	assertEqual(t, f.databaseCalls("pg_dump"), []string{"app", "billing"})
+	assertEqual(t, keys(f.s3.calls("PUT")), []string{"backup/app/latest.dump", "backup/billing/latest.dump"})
 }
 
 func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {

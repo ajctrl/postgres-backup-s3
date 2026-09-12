@@ -13,6 +13,7 @@ import (
 	"time"
 	_ "time/tzdata"
 
+	"github.com/aws/smithy-go"
 	"github.com/bartels/postgres-backup-s3/internal/storage"
 	"github.com/robfig/cron/v3"
 )
@@ -99,9 +100,12 @@ func (a *App) Backup(ctx context.Context) error {
 	if a.Config.FilenameMode == "fixed" {
 		enabled, err := a.Store.VersioningEnabled(ctx)
 		if err != nil {
-			return fmt.Errorf("Could not verify S3 bucket versioning: %w", err)
-		}
-		if !enabled {
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "AccessDenied" {
+				return fmt.Errorf("Could not verify S3 bucket versioning: %w", err)
+			}
+			fmt.Fprintf(a.Err, "Warning: Could not verify S3 bucket versioning: %v. Continuing backup; ensure bucket versioning is Enabled to retain previous fixed-name backups.\n", err)
+		} else if !enabled {
 			return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
 		}
 	}
