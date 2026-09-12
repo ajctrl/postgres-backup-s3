@@ -1,28 +1,14 @@
-#! /bin/sh
+#!/bin/sh
 
-set -eux
-set -o pipefail
+set -eu
 
-apk update
-
-# install pg_dump
-apk add postgresql-client
-
-# install gpg
-apk add gnupg
-
-# Resolve flock's provider across Alpine versions (util-linux or standalone flock).
-apk add aws-cli jq 'cmd:flock'
-
-# install go-cron
-apk add curl
-curl -L https://github.com/ivoronin/go-cron/releases/download/v0.0.5/go-cron_0.0.5_linux_${TARGETARCH}.tar.gz -O
-tar xvf go-cron_0.0.5_linux_${TARGETARCH}.tar.gz
-rm go-cron_0.0.5_linux_${TARGETARCH}.tar.gz
-mv go-cron /usr/local/bin/go-cron
-chmod u+x /usr/local/bin/go-cron
-apk del curl
-
-
-# cleanup
-rm -rf /var/cache/apk/*
+# Older Alpine images retain their PostgreSQL client major version. Their GPG
+# package predates the separate gpg and gpg-agent packages.
+case "$(cat /etc/alpine-release)" in
+  3.[0-9].*|3.1[0-4].*)
+    apk add --no-cache postgresql-client gnupg ca-certificates
+    ;;
+  *)
+    apk add --no-cache postgresql-client gpg gpg-agent ca-certificates
+    ;;
+esac

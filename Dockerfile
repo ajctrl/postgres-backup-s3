@@ -1,9 +1,22 @@
 ARG ALPINE_VERSION='3.21'
-FROM alpine:${ALPINE_VERSION}
-ARG TARGETARCH
+ARG GO_VERSION='1.26'
 
-ADD src/install.sh install.sh
-RUN sh install.sh && rm install.sh
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY internal/ internal/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags='-s -w' -o /out/postgres-backup-s3 ./cmd/postgres-backup-s3
+
+FROM alpine:${ALPINE_VERSION}
+COPY src/install.sh /install.sh
+RUN sh /install.sh && rm /install.sh
+COPY --from=build /out/postgres-backup-s3 /usr/local/bin/postgres-backup-s3
 
 ENV POSTGRES_DATABASE=''
 ENV POSTGRES_DATABASES=''
@@ -27,9 +40,6 @@ ENV PASSPHRASE=''
 ENV BACKUP_KEEP_DAYS=''
 ENV BACKUP_FILENAME_MODE='timestamp'
 
-ADD src/run.sh run.sh
-ADD src/env.sh env.sh
-ADD src/backup.sh backup.sh
-ADD src/restore.sh restore.sh
+COPY src/run.sh src/backup.sh src/restore.sh /
 
-CMD ["sh", "run.sh"]
+CMD ["postgres-backup-s3", "run"]

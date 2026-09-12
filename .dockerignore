@@ -1,2 +1,10 @@
-*
-!src/*
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!src/
+!src/*.sh
+**/*_test.go
