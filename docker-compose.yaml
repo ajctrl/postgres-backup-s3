@@ -15,7 +15,7 @@ services:
         ALPINE_VERSION: '3.16'
     environment:
       SCHEDULE: '@weekly'     # optional
-      BACKUP_KEEP_DAYS: 7     # optional
+      BACKUP_KEEP_DAYS: 7     # optional; deletes expired timestamped backups ONLY
       PASSPHRASE: passphrase  # optional
       S3_REGION:
       S3_ACCESS_KEY_ID:

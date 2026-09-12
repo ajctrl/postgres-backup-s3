@@ -11,7 +11,8 @@ apk add postgresql-client
 # install gpg
 apk add gnupg
 
-apk add aws-cli
+# Resolve flock's provider across Alpine versions (util-linux or standalone flock).
+apk add aws-cli jq 'cmd:flock'
 
 # install go-cron
 apk add curl
