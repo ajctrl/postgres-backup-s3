@@ -17,14 +17,14 @@ The image combines a Go executable, AWS SDK for Go v2, PostgreSQL client tools a
 
 Use an existing PostgreSQL database and S3 bucket. The database must be reachable from the backup container, and the configured user must be able to read the selected database.
 
-Images use PostgreSQL major-version tags `12` through `17` and support `linux/amd64` and `linux/arm64`. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:17`; for a fork, use `ghcr.io/<owner>/<repository>:17` in lowercase after [publishing its images](#publishing-images).
+Images use PostgreSQL major-version tags `12` through `18` and support `linux/amd64` and `linux/arm64`. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:18`; for a fork, use `ghcr.io/<owner>/<repository>:18` in lowercase after [publishing its images](#publishing-images).
 
 Create a `compose.yaml` for the backup service. Replace the example connection and bucket values. This example takes AWS access keys and an optional encryption passphrase from your shell or a `.env` file next to `compose.yaml`:
 
 ```yaml
 services:
   backup:
-    image: ghcr.io/ajctrl/postgres-backup-s3:17
+    image: ghcr.io/ajctrl/postgres-backup-s3:18
     environment:
       POSTGRES_HOST: postgres.example.com
       POSTGRES_PORT: "5432"
@@ -300,7 +300,7 @@ The workflow uses the lowercase `github.repository` value for `ghcr.io/<owner>/<
 3. For anonymous pulls, change the new package's visibility to **Public** in its package settings. GHCR packages are [private on first publication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images), even when the repository is public.
 
 ```sh
-docker pull ghcr.io/ajctrl/postgres-backup-s3:17
+docker pull ghcr.io/ajctrl/postgres-backup-s3:18
 ```
 
 ### Optional Docker Hub publishing
@@ -369,6 +369,7 @@ docker buildx build --platform linux/amd64,linux/arm64 --build-arg ALPINE_VERSIO
 | `15` | `3.17` |
 | `16` | `3.19` |
 | `17` | `3.21` |
+| `18` | `3.23` |
 
 Older Alpine releases preserve existing PostgreSQL tags; several are outside normal support. See [Alpine's support table](https://alpinelinux.org/releases/). Alpine 3.12 and 3.14 install `gnupg`; newer images use `gpg` and `gpg-agent`.
 
