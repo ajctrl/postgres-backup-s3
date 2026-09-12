@@ -204,7 +204,7 @@ func TestS3StalledMultipartUploadIsAborted(t *testing.T) {
 	f.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if err := s.Upload(ctx, "large.dump", path); err == nil || ctx.Err() != nil {
+	if err := s.Upload(ctx, "large.dump", openUpload(t, path)); err == nil || ctx.Err() != nil {
 		t.Fatalf("stalled multipart upload: err=%v context=%v", err, ctx.Err())
 	}
 	if !aborted.Load() {

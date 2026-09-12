@@ -96,56 +96,45 @@ func (a *App) Backup(ctx context.Context) error {
 	// that boundary so objects at the cutoff second are still retained.
 	cutoff := a.now().UTC().Truncate(time.Second).Add(-time.Duration(days) * 24 * time.Hour)
 	runner := a.runner(lock)
-	return withWorkspace(func(dir string) error {
-		if a.Config.FilenameMode == "fixed" {
-			enabled, err := a.Store.VersioningEnabled(ctx)
-			if err != nil {
-				return fmt.Errorf("Could not verify S3 bucket versioning: %w", err)
-			}
-			if !enabled {
-				return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
-			}
-		}
-		databases, err := a.databases(ctx, runner)
+	if a.Config.FilenameMode == "fixed" {
+		enabled, err := a.Store.VersioningEnabled(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("Could not verify S3 bucket versioning: %w", err)
 		}
-		succeeded, failed, cleanupFailed := 0, 0, 0
-		var cleanupErr error
-		for i, database := range databases {
-			if ctx.Err() != nil {
-				break
-			}
-			dbDir := filepath.Join(dir, fmt.Sprint(i))
-			if err := os.Mkdir(dbDir, 0700); err != nil {
-				return err
-			}
-			if err := a.backupDatabase(ctx, runner, database, dbDir); err != nil {
-				fmt.Fprintf(a.Err, "Backup failed: %s: %v\n", database, err)
-				failed++
-			} else {
-				succeeded++
-				if days > 0 {
-					if err := a.removeOldBackups(ctx, database, cutoff); err != nil {
-						fmt.Fprintf(a.Err, "Retention cleanup failed: %s: %v\n", database, err)
-						cleanupFailed++
-					}
+		if !enabled {
+			return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
+		}
+	}
+	databases, err := a.databases(ctx, runner)
+	if err != nil {
+		return err
+	}
+	succeeded, failed, cleanupFailed := 0, 0, 0
+	for _, database := range databases {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := a.backupDatabase(ctx, runner, database); err != nil {
+			fmt.Fprintf(a.Err, "Backup failed: %s: %v\n", database, err)
+			failed++
+		} else {
+			succeeded++
+			if days > 0 {
+				if err := a.removeOldBackups(ctx, database, cutoff); err != nil {
+					fmt.Fprintf(a.Err, "Retention cleanup failed: %s: %v\n", database, err)
+					cleanupFailed++
 				}
 			}
-			if err := os.RemoveAll(dbDir); err != nil {
-				cleanupErr = fmt.Errorf("remove temporary backup files: %w", err)
-				break
-			}
 		}
-		fmt.Fprintf(a.Out, "Backup summary: %d succeeded, %d failed, %d retention cleanups failed.\n", succeeded, failed, cleanupFailed)
-		if err := errors.Join(ctx.Err(), cleanupErr); err != nil {
-			return err
-		}
-		if failed > 0 || cleanupFailed > 0 {
-			return fmt.Errorf("backup run completed with failures")
-		}
-		return nil
-	})
+	}
+	fmt.Fprintf(a.Out, "Backup summary: %d succeeded, %d failed, %d retention cleanups failed.\n", succeeded, failed, cleanupFailed)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if failed > 0 || cleanupFailed > 0 {
+		return fmt.Errorf("backup run completed with failures")
+	}
+	return nil
 }
 
 func (a *App) connectionArgs(database string) []string {
@@ -200,32 +189,40 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 	return selected, nil
 }
 
-func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database, dir string) error {
+func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database string) error {
 	key := a.Config.backupKey(database, a.now())
 	fmt.Fprintf(a.Out, "Creating backup of %s database...\n", database)
-	path := filepath.Join(dir, "db.dump")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
 	args := append([]string{"--format=custom"}, a.connectionArgs(database)...)
 	// Preserve shell IFS splitting; quotes and wildcards remain literal data.
 	opts := strings.FieldsFunc(a.Config.DumpOptions, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' })
-	args = append(args, opts...)
-	err = runner.run(ctx, file, "pg_dump", args...)
-	err = errors.Join(err, file.Close())
-	if err != nil {
-		return err
-	}
+	commands := []pipelineCommand{{name: "pg_dump", args: append(args, opts...)}}
 	if a.Config.Passphrase != "" {
 		fmt.Fprintf(a.Out, "Encrypting backup of %s...\n", database)
-		if err := runner.run(ctx, a.Out, "gpg", "--symmetric", "--batch", "--pinentry-mode", "loopback", "--passphrase", a.Config.Passphrase, "--output", path+".gpg", path); err != nil {
-			return err
-		}
-		path += ".gpg"
+		commands = append(commands, pipelineCommand{name: "gpg", args: []string{
+			"--symmetric", "--batch", "--pinentry-mode", "loopback", "--passphrase", a.Config.Passphrase, "--output", "-",
+		}})
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	// Closing the reader also unblocks os/exec's stdout copier on cancellation.
+	stop := context.AfterFunc(ctx, func() { reader.CloseWithError(ctx.Err()) })
+	defer stop()
+	done := make(chan error, 1)
+	go func() {
+		err := runner.pipeline(ctx, writer, commands...)
+		writer.CloseWithError(err)
+		done <- err
+	}()
 	fmt.Fprintf(a.Out, "Uploading backup of %s...\n", database)
-	if err := a.Store.Upload(ctx, key, path); err != nil {
+	uploadErr := a.Store.Upload(ctx, key, reader)
+	// An upload failure must stop both pg_dump and GPG and release backpressure.
+	if uploadErr != nil {
+		cancel()
+		reader.CloseWithError(uploadErr)
+	}
+	if err := errors.Join(uploadErr, <-done); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.Out, "Backup complete: %s\n", database)

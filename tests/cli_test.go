@@ -49,11 +49,9 @@ func TestMain(m *testing.M) {
 const fakeTool = `#!/bin/sh
 set -eu
 command=${0##*/}
-{
-  printf '%s' "$command"
-  for arg do printf '\t%s' "$arg"; done
-  printf '\n'
-} >> "$FAKE_LOG"
+line=$command
+for arg do line="$line	$arg"; done
+printf '%s\n' "$line" >> "$FAKE_LOG"
 database=''
 output=''
 previous=''
@@ -87,14 +85,18 @@ case "$command" in
     [ "${FAKE_RESTORE_FAILURE:-}" != true ] || exit 1
     ;;
   gpg)
-    if [ -n "${FAKE_GPG_FAILURE:-}" ]; then
-      case "$(cat "$source")" in *"$FAKE_GPG_FAILURE"*) exit 1;; esac
-    fi
     if [ "$decrypt" = true ]; then
+      if [ -n "${FAKE_GPG_FAILURE:-}" ]; then
+        case "$(cat "$source")" in *"$FAKE_GPG_FAILURE"*) exit 1;; esac
+      fi
       if [ -n "$output" ]; then cp "$source" "$output"; else cat "$source"; fi
     else
-      [ -n "$output" ] || output=$source.gpg
-      cp "$source" "$output"
+      payload=$(cat)
+      if [ -n "${FAKE_GPG_FAILURE:-}" ]; then
+        case "$payload" in *"$FAKE_GPG_FAILURE"*) exit 1;; esac
+      fi
+      [ "$output" = - ] || exit 5
+      printf '%s\n' "$payload"
     fi
     ;;
   *) exit 4;;
@@ -164,6 +166,14 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch action {
+	case "POST":
+		if query.Has("uploads") {
+			io.WriteString(w, `<InitiateMultipartUploadResult><UploadId>stream</UploadId></InitiateMultipartUploadResult>`)
+		} else if query.Has("uploadId") {
+			io.WriteString(w, `<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	case "versioning":
 		xml.NewEncoder(w).Encode(struct {
 			XMLName xml.Name `xml:"VersioningConfiguration"`

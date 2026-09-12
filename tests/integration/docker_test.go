@@ -184,6 +184,31 @@ func TestDockerBackupRestore(t *testing.T) {
 		runBackupImage(t, env, "postgres-backup-s3", "restore")
 		assertValue(t, "second encrypted version")
 	})
+	t.Run("streaming_encrypted_multipart", func(t *testing.T) {
+		// Incompressible enough to cross the multipart threshold even after GPG.
+		sql(t, "CREATE TABLE stream_probe AS SELECT g AS id, md5(g::text) || md5((g + 1000000)::text) AS value FROM generate_series(1, 400000) AS g;")
+		want := sql(t, "SELECT count(*) || ':' || md5(string_agg(value, '' ORDER BY id)) FROM stream_probe")
+		env := map[string]string{
+			"S3_PREFIX": "streaming", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "streaming passphrase",
+			"S3_UPLOAD_PART_SIZE_MB": "5", "PGDUMP_EXTRA_OPTS": "--compress=0", "TMPDIR": "/proc",
+		}
+		// /proc cannot hold temporary dump files. Only streaming can succeed here.
+		runBackupImage(t, env, "postgres-backup-s3", "backup")
+		object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("streaming/app/latest.dump.gpg")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if aws.ToInt64(object.ContentLength) <= 5*1024*1024 || !strings.Contains(aws.ToString(object.ETag), "-") {
+			t.Fatalf("expected an encrypted multipart object: size=%d etag=%s", aws.ToInt64(object.ContentLength), aws.ToString(object.ETag))
+		}
+		sql(t, "TRUNCATE stream_probe")
+		// Restore still validates downloaded/decrypted files before touching the DB.
+		env["TMPDIR"] = "/tmp"
+		runBackupImage(t, env, "postgres-backup-s3", "restore")
+		if got := sql(t, "SELECT count(*) || ':' || md5(string_agg(value, '' ORDER BY id)) FROM stream_probe"); got != want {
+			t.Fatalf("streaming round trip changed data: got %q, want %q", got, want)
+		}
+	})
 }
 
 func docker(t *testing.T, ctx context.Context, args ...string) string {

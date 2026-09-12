@@ -20,7 +20,7 @@ type recordingStore struct {
 }
 
 func (s *recordingStore) VersioningEnabled(context.Context) (bool, error)        { return true, nil }
-func (s *recordingStore) Upload(context.Context, string, string) error           { return nil }
+func (s *recordingStore) Upload(context.Context, string, io.ReadCloser) error    { return nil }
 func (s *recordingStore) Download(context.Context, string, string, string) error { return nil }
 func (s *recordingStore) List(_ context.Context, prefix string) ([]storage.Object, error) {
 	s.prefix = prefix

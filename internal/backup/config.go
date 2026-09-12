@@ -70,6 +70,11 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed.")
 	}
+	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
+	if err != nil || partSize < 5 || partSize > 5120 {
+		return c, fmt.Errorf("S3_UPLOAD_PART_SIZE_MB must be an integer between 5 and 5120 (MiB).")
+	}
+	c.Storage.UploadPartSizeBytes = partSize * 1024 * 1024
 	return c, nil
 }
 

@@ -41,6 +41,22 @@ Existing environment variables and shell entrypoints remain supported. `S3_ACCES
 
 S3 connections time out after 60 seconds without send or receive progress. Active transfers can run longer than 60 seconds. Once SDK retries are exhausted, the operation fails and normal cleanup releases the backup lock.
 
+Backups stream directly from `pg_dump` to S3. With `PASSPHRASE` set, the pipeline is `pg_dump → GPG → S3`; neither the plaintext dump nor the encrypted dump is written to a temporary file. The `.dump` / `.dump.gpg` formats and restore commands remain compatible. Restore still downloads and, when needed, decrypts into temporary files before running `pg_restore`, so it needs disk space for those files.
+
+Uploads buffer parts in memory and send up to two parts concurrently. `S3_UPLOAD_PART_SIZE_MB` sets the part size in MiB (default `8`, range `5`–`5120`). Memory usage is proportional to a few parts, not the total backup size; larger parts require more memory. Smaller backups are buffered and uploaded in one request.
+
+S3 allows [at most 10,000 parts per multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html). With the default part size, the limit is **8 MiB × 10,000 = 78.125 GiB per backup**. This applies to the bytes actually uploaded after compression and, when enabled, encryption—not the database's on-disk size.
+
+The final size is unknown when streaming starts, and the current implementation uses a fixed part size throughout the upload; it does not automatically increase the part size. To upload more than 78.125 GiB, set a larger value before starting the backup. For example, this Docker Compose environment setting allows up to 625 GiB per backup, at the cost of larger memory buffers:
+
+```yaml
+S3_UPLOAD_PART_SIZE_MB: "64"
+```
+
+Exceeding 10,000 parts fails and aborts the upload instead of publishing a truncated backup. Choose a part size with enough headroom for the expected uploaded size.
+
+The upload is completed only after `pg_dump` and, when enabled, GPG succeed. A producer failure aborts the multipart upload and preserves any previous fixed-name backup. An S3 failure stops the pipeline. Retention is skipped for failed databases. Configure an S3 lifecycle rule to abort incomplete multipart uploads left by abrupt termination such as `SIGKILL` or a host crash.
+
 `PGDUMP_EXTRA_OPTS` retains its whitespace-separated argument interface; it is not evaluated as shell code. The executable also supports direct commands such as `docker exec <container name> postgres-backup-s3 backup` and `docker exec <container name> postgres-backup-s3 restore --version-id '<VersionId>'`.
 
 ### Multiple databases
@@ -65,8 +81,8 @@ POSTGRES_DATABASES_EXCLUDE: "scratch,test_db"  # optional, exact names
 - All-database mode excludes template databases and databases with connections disabled, and includes `postgres`. Remaining databases run in database-name order. Newly created databases are included on the next run.
 - `POSTGRES_DATABASES_EXCLUDE` is available only in all-database mode. Exclusions are logged. Empty selections and discovery failures are errors.
 - The configured user needs to connect to the maintenance database and read the contents of every target database. Permission failures are reported, not silently skipped.
-- Each database is dumped, optionally encrypted, and uploaded before starting the next. Failed dumps/encryption are not uploaded. Failures do not prevent later databases from running; the final summary and exit status report backup and retention failures. When scheduled, this is the backup command's status; the scheduler process remains running.
-- Temporary files are isolated per run and removed on exit. Backups are saved locally before upload; encrypted runs temporarily hold both the plaintext dump and encrypted file, so allow enough writable disk space for both. A container-wide file lock at `/tmp/postgres-backup-s3.lock` prevents overlapping backups, including scheduled and manual runs. It covers discovery, dump, encryption, upload and retention. An overlapping run exits nonzero before accessing PostgreSQL or S3; it does not queue. Go acquires the operating system lock directly. The lock is released when the processes exit; the lock file is intentionally kept and must not be deleted while backups are running. This lock does not coordinate separate containers; use only one backup writer per S3 destination.
+- Each database is dumped, optionally encrypted, and uploaded before starting the next. Failed dumps/encryption do not publish a completed backup. Failures do not prevent later databases from running; the final summary and exit status report backup and retention failures. When scheduled, this is the backup command's status; the scheduler process remains running.
+- Backup streams use bounded memory buffers instead of temporary dump files. Restore temporary files are isolated per run and removed on exit. A container-wide file lock at `/tmp/postgres-backup-s3.lock` prevents overlapping backups, including scheduled and manual runs. It covers discovery, dump, encryption, upload and retention. An overlapping run exits nonzero before accessing PostgreSQL or S3; it does not queue. Go acquires the operating system lock directly. The lock is released when the processes exit; the lock file is intentionally kept and must not be deleted while backups are running. This lock does not coordinate separate containers; use only one backup writer per S3 destination.
 - These are separate database snapshots, not a single consistent snapshot across databases. Role and tablespace definitions are not included; global-object backups using `pg_dumpall --globals-only` remain outside this feature.
 
 ### Filenames and S3 versioning
@@ -176,7 +192,7 @@ docker build -t postgres-backup-s3:go-migration .
 go test -count=1 -tags=integration -v -timeout=15m ./tests/integration
 ```
 
-This requires a local Docker daemon. The suite creates disposable PostgreSQL and MinIO containers, checks plaintext timestamp backup/restore and encrypted fixed-name backups with previous-VersionId restore, then removes its containers and network. It also runs encrypted backups twice in one container to check lock release while the GPG agent remains running. It uses isolated test credentials and does not contact AWS. `BACKUP_TEST_IMAGE`, `POSTGRES_TEST_IMAGE` and `S3_TEST_IMAGE` override the default images (`postgres-backup-s3:go-migration`, `postgres:17` and the MinIO image pinned by digest in [the integration test](tests/integration/docker_test.go)).
+This requires a local Docker daemon. The suite creates disposable PostgreSQL and MinIO containers, checks plaintext timestamp backup/restore and encrypted fixed-name backups with previous-VersionId restore, then removes its containers and network. It also runs encrypted backups twice in one container to check lock release while the GPG agent remains running. A multipart encrypted backup runs with an unwritable temporary directory, followed by a restore that verifies the row count and a checksum of all values. It uses isolated test credentials and does not contact AWS. `BACKUP_TEST_IMAGE`, `POSTGRES_TEST_IMAGE` and `S3_TEST_IMAGE` override the default images (`postgres-backup-s3:go-migration`, `postgres:17` and the MinIO image pinned by digest in [the integration test](tests/integration/docker_test.go)).
 
 Tests cover configuration, database selection, backup/restore orchestration, retention and S3 behavior without requiring AWS credentials. Go interfaces and local test servers allow failure paths and pagination to be exercised without external services. The GitHub Actions workflow runs race checks and vet, then the Docker integration suite, on pushes and pull requests. Both test jobs must pass before the PostgreSQL image matrix builds. Registry authentication and publishing occur only on pushes to `master`.
 

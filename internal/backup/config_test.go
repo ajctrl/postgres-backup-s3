@@ -106,3 +106,19 @@ func TestScheduleCompatibility(t *testing.T) {
 		}
 	}
 }
+
+func TestUploadPartSizeConfiguration(t *testing.T) {
+	for _, value := range []string{"", "5", "8", "64", "5120", "4", "5121", "-1", "1.5", "huge"} {
+		t.Run(value, func(t *testing.T) {
+			env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db", "S3_UPLOAD_PART_SIZE_MB": value}
+			c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+			valid := value == "" || value == "5" || value == "8" || value == "64" || value == "5120"
+			if (err == nil) != valid {
+				t.Fatalf("part size %q: %v", value, err)
+			}
+			if value == "64" && c.Storage.UploadPartSizeBytes != 64*1024*1024 {
+				t.Fatalf("part size was not converted to bytes: %d", c.Storage.UploadPartSizeBytes)
+			}
+		})
+	}
+}

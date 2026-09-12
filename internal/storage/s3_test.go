@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 )
 
 func isolatedAWS(t *testing.T) {
@@ -125,7 +124,7 @@ func TestS3SignedRequestsAndFileRoundTrip(t *testing.T) {
 	if err := os.WriteFile(path, payload, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Upload(ctx, key, path); err != nil {
+	if err := s.Upload(ctx, key, openUpload(t, path)); err != nil {
 		t.Fatal(err)
 	}
 	if uploaded.Load() == nil || !bytes.Equal(uploaded.Load().([]byte), payload) {
@@ -258,16 +257,12 @@ func TestS3MultipartUpload(t *testing.T) {
 			writeS3Error(w, http.StatusBadRequest, "BadRequest")
 		}
 	})
-	s.transfer = transfermanager.New(s.client, func(o *transfermanager.Options) {
-		o.PartSizeBytes = partSize
-		o.MultipartUploadThreshold = partSize
-		o.Concurrency = 2
-	})
+	s.uploadPartSize = partSize
 	path := filepath.Join(t.TempDir(), "large.dump")
 	if err := os.WriteFile(path, payload, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Upload(context.Background(), "large.dump", path); err != nil {
+	if err := s.Upload(context.Background(), "large.dump", openUpload(t, path)); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -309,7 +304,7 @@ func TestS3CanceledMultipartUploadIsAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := s.Upload(ctx, "large.dump", path); err == nil {
+	if err := s.Upload(ctx, "large.dump", openUpload(t, path)); err == nil {
 		t.Fatal("canceled upload succeeded")
 	}
 	if !aborted.Load() {
@@ -434,7 +429,7 @@ func TestS3DisabledVersioningAndCancellation(t *testing.T) {
 	cancel()
 	for name, operation := range map[string]func() error{
 		"versioning": func() error { _, err := s.VersioningEnabled(ctx); return err },
-		"upload":     func() error { return s.Upload(ctx, "key", "missing") },
+		"upload":     func() error { return s.Upload(ctx, "key", io.NopCloser(strings.NewReader("unused"))) },
 		"download":   func() error { return s.Download(ctx, "key", "", "missing") },
 		"list":       func() error { _, err := s.List(ctx, ""); return err },
 		"delete":     func() error { return s.Delete(ctx, "key") },
@@ -470,4 +465,14 @@ func TestS3RespectsConfiguredChecksums(t *testing.T) {
 	if s.client.Options().RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired {
 		t.Error("SDK checksum configuration was not preserved")
 	}
+}
+
+func openUpload(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
 }
