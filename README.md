@@ -1,220 +1,367 @@
-# Introduction
-This project provides Docker images to periodically back up one or more PostgreSQL databases to AWS S3, and to restore individual databases as needed.
+# PostgreSQL Backup to S3
 
-Backup orchestration, S3 access, retention, scheduling and process locking run in a single Go executable using AWS SDK for Go v2. PostgreSQL's `pg_dump`, `pg_restore` and `psql` still handle database operations; GPG keeps encrypted backups compatible with existing files. The runtime image contains the executable, PostgreSQL client, GPG and CA certificates. AWS CLI, Python, jq and the external cron and flock utilities are no longer required.
+Back up one or more PostgreSQL databases to AWS S3 or S3-compatible storage, and restore individual databases when needed. Backups stream directly to S3, with optional GPG encryption and no temporary dump files.
 
-# Usage
-## Backup
+The image combines a Go executable, AWS SDK for Go v2, PostgreSQL client tools and GPG. It supports scheduled or manual backups, timestamp-based retention, and fixed filenames backed by S3 versioning. AWS CLI and Python are not required.
+
+- [Quick start](#quick-start)
+- [Back up databases](#back-up-databases)
+- [Restore a database](#restore-a-database)
+- [Storage and retention](#storage-and-retention)
+- [Environment variable reference](#environment-variable-reference)
+- [Publishing images](#publishing-images)
+- [Development](#development)
+- [Compatibility](#compatibility)
+
+## Quick start
+
+Use an existing PostgreSQL database and S3 bucket. The database must be reachable from the backup container, and the configured user must be able to read the selected database.
+
+Images use PostgreSQL major-version tags `12` through `17` and support `linux/amd64` and `linux/arm64`. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:17`; for a fork, use `ghcr.io/<owner>/<repository>:17` in lowercase after [publishing its images](#publishing-images).
+
+Create a `compose.yaml` for the backup service. Replace the example connection and bucket values. This example takes AWS access keys and an optional encryption passphrase from your shell or a `.env` file next to `compose.yaml`:
+
 ```yaml
 services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-
   backup:
-    image: bartels/postgres-backup-s3:17
+    image: ghcr.io/ajctrl/postgres-backup-s3:17
     environment:
-      SCHEDULE: '@weekly'     # optional
-      BACKUP_KEEP_DAYS: 7     # optional; deletes expired timestamped backups ONLY
-      PASSPHRASE: passphrase  # optional
-      S3_REGION: region
-      S3_ACCESS_KEY_ID: key
-      S3_SECRET_ACCESS_KEY: secret
-      S3_BUCKET: my-bucket
+      POSTGRES_HOST: postgres.example.com
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: app
+      POSTGRES_USER: backup
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+      S3_BUCKET: my-backup-bucket
+      S3_REGION: us-west-1
       S3_PREFIX: backup
-      POSTGRES_HOST: postgres
-      POSTGRES_DATABASE: dbname
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}"
+      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}"
+      SCHEDULE: "0 2 * * *"
+      BACKUP_KEEP_DAYS: "7"
+      PASSPHRASE: "${PASSPHRASE:-}"
 ```
 
-- Images are tagged by the major PostgreSQL version supported: `12`, `13`, `14`, `15` or `16` or `17`.
-- The `SCHEDULE` variable determines backup frequency. It accepts five fields (`minute hour day-of-month month day-of-week`), six fields with leading seconds, and descriptors such as `@weekly` or `@every 1h`. For example, `0 0 2 * * *` runs daily at 02:00. Schedules use the container's local timezone (UTC by default); use `CRON_TZ=Asia/Tokyo 0 0 2 * * *` for an explicit timezone. Omit `SCHEDULE` to run the backup immediately and then exit. With a schedule, the first backup runs at the next scheduled time.
-- If `PASSPHRASE` is provided, the backup will be encrypted using GPG.
-- Run `docker exec <container name> sh backup.sh` to trigger a backup ad-hoc.
-- **`BACKUP_KEEP_DAYS` applies ONLY to timestamped backup files** such as `app_2026-09-12T12:00:00.dump` (including `.dump.gpg`). It does **not** delete fixed-name `latest.dump` / `latest.dump.gpg` files or their S3 version history. See [Backup retention](#backup-retention) for retention rules and versioned-bucket behavior.
-- Set `S3_ENDPOINT` if you're using a non-AWS S3-compatible storage provider.
+For profiles or workload IAM roles, omit the two `S3_*` credential entries and configure the [AWS credential chain](#s3-destination-and-credentials). Set `S3_ENDPOINT` for a non-AWS storage provider.
 
-Existing environment variables and shell entrypoints remain supported. `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` override the corresponding AWS credential variables when provided. Otherwise the AWS SDK uses its standard credential chain, including `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, shared profiles and workload IAM roles. `S3_REGION` defaults to `us-west-1`. Requests use Signature Version 4; the legacy `S3_S3V4` setting is accepted for compatibility and no longer needs to be enabled.
+Start the scheduler, trigger the first backup, and inspect its logs:
 
-S3 connections time out after 60 seconds without send or receive progress. Active transfers can run longer than 60 seconds. Once SDK retries are exhausted, the operation fails and normal cleanup releases the backup lock.
-
-Backups stream directly from `pg_dump` to S3. With `PASSPHRASE` set, the pipeline is `pg_dump → GPG → S3`; neither the plaintext dump nor the encrypted dump is written to a temporary file. The `.dump` / `.dump.gpg` formats and restore commands remain compatible. Restore still downloads and, when needed, decrypts into temporary files before running `pg_restore`, so it needs disk space for those files.
-
-Uploads buffer parts in memory and send up to two parts concurrently. `S3_UPLOAD_PART_SIZE_MB` sets the part size in MiB (default `8`, range `5`–`5120`). Memory usage is proportional to a few parts, not the total backup size; larger parts require more memory. Smaller backups are buffered and uploaded in one request.
-
-S3 allows [at most 10,000 parts per multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html). With the default part size, the limit is **8 MiB × 10,000 = 78.125 GiB per backup**. This applies to the bytes actually uploaded after compression and, when enabled, encryption—not the database's on-disk size.
-
-The final size is unknown when streaming starts, and the current implementation uses a fixed part size throughout the upload; it does not automatically increase the part size. To upload more than 78.125 GiB, set a larger value before starting the backup. For example, this Docker Compose environment setting allows up to 625 GiB per backup, at the cost of larger memory buffers:
-
-```yaml
-S3_UPLOAD_PART_SIZE_MB: "64"
+```sh
+docker compose up -d backup
+docker compose exec backup postgres-backup-s3 backup
+docker compose logs -f backup
 ```
 
-Exceeding 10,000 parts fails and aborts the upload instead of publishing a truncated backup. Choose a part size with enough headroom for the expected uploaded size.
+The schedule above runs daily at 02:00 UTC by default. Scheduled containers wait until the next scheduled time; they do not back up immediately on startup. The manual command runs immediately. Setting `PASSPHRASE` enables encryption; leaving it empty produces an unencrypted dump. Retention removes eligible timestamped backups after seven days—see [retention rules](#backup-retention).
 
-The upload is completed only after `pg_dump` and, when enabled, GPG succeed. A producer failure aborts the multipart upload and preserves any previous fixed-name backup. An S3 failure stops the pipeline. Retention is skipped for failed databases. Configure an S3 lifecycle rule to abort incomplete multipart uploads left by abrupt termination such as `SIGKILL` or a host crash.
+## Back up databases
 
-`PGDUMP_EXTRA_OPTS` retains its whitespace-separated argument interface; it is not evaluated as shell code. The executable also supports direct commands such as `docker exec <container name> postgres-backup-s3 backup` and `docker exec <container name> postgres-backup-s3 restore --version-id '<VersionId>'`.
+### Commands and scheduling
 
-### Multiple databases
+| Command | Behavior |
+| --- | --- |
+| `postgres-backup-s3 run` | Default container command. Uses `SCHEDULE`, or backs up once and exits when it is unset or empty. |
+| `postgres-backup-s3 backup` | Backs up immediately, regardless of `SCHEDULE`. |
+| `postgres-backup-s3 restore [timestamp \| --version-id ID]` | Restores one database; see [restore instructions](#restore-a-database). |
 
-Use the same host, port and credentials for every database. List names separated by commas:
+`SCHEDULE` accepts five cron fields (`minute hour day-of-month month day-of-week`), six fields with leading seconds, and descriptors such as `@weekly` or `@every 1h`. For example, `0 0 2 * * *` runs daily at 02:00. Schedules use the container's local timezone, normally UTC; `CRON_TZ=Asia/Tokyo 0 0 2 * * *` selects a timezone explicitly. Backup timestamps always use UTC.
+
+### Select databases
+
+Set `POSTGRES_DATABASE` for one database, or use a comma-separated list:
 
 ```yaml
 POSTGRES_DATABASES: "app,analytics,billing"
 ```
 
-`POSTGRES_DATABASES` takes precedence over the legacy `POSTGRES_DATABASE` when nonempty. Surrounding whitespace in lists is trimmed, empty entries are rejected, and duplicates are backed up once in the configured order. `ALL` is an ordinary database name. Names containing commas can be selected using `POSTGRES_DATABASE` or discovered with all-database mode; control characters in names are rejected.
+`POSTGRES_DATABASES` takes precedence for backup. Lists are trimmed, empty entries are rejected, and duplicates are removed while preserving order. `ALL` is an ordinary name. Use `POSTGRES_DATABASE` or discovery for names containing commas; control characters are rejected.
 
-To discover all databases at the start of every backup run:
-
-```yaml
-POSTGRES_BACKUP_ALL: "true"
-POSTGRES_MAINTENANCE_DB: postgres       # connection used to query the database list
-POSTGRES_DATABASES_EXCLUDE: "scratch,test_db"  # optional, exact names
-```
-
-- `POSTGRES_BACKUP_ALL` defaults to `false` and accepts only `true` or `false`. When true, leave both `POSTGRES_DATABASE` and `POSTGRES_DATABASES` unset or empty.
-- All-database mode excludes template databases and databases with connections disabled, and includes `postgres`. Remaining databases run in database-name order. Newly created databases are included on the next run.
-- `POSTGRES_DATABASES_EXCLUDE` is available only in all-database mode. Exclusions are logged. Empty selections and discovery failures are errors.
-- The configured user needs to connect to the maintenance database and read the contents of every target database. Permission failures are reported, not silently skipped.
-- Each database is dumped, optionally encrypted, and uploaded before starting the next. Failed dumps/encryption do not publish a completed backup. Failures do not prevent later databases from running; the final summary and exit status report backup and retention failures. When scheduled, this is the backup command's status; the scheduler process remains running.
-- Backup streams use bounded memory buffers instead of temporary dump files. Restore temporary files are isolated per run and removed on exit. A container-wide file lock at `/tmp/postgres-backup-s3.lock` prevents overlapping backups, including scheduled and manual runs. It covers discovery, dump, encryption, upload and retention. An overlapping run exits nonzero before accessing PostgreSQL or S3; it does not queue. Go acquires the operating system lock directly. The lock is released when the processes exit; the lock file is intentionally kept and must not be deleted while backups are running. This lock does not coordinate separate containers; use only one backup writer per S3 destination.
-- These are separate database snapshots, not a single consistent snapshot across databases. Role and tablespace definitions are not included; global-object backups using `pg_dumpall --globals-only` remain outside this feature.
-
-### Filenames and S3 versioning
-
-`BACKUP_FILENAME_MODE` defaults to `timestamp`, preserving the existing keys:
-
-```text
-backup/app_2026-09-12T10:00:00.dump
-backup/analytics_2026-09-12T10:00:15.dump
-```
-
-Timestamp mode preserves the original `${S3_PREFIX}/` layout exactly. For example, `S3_PREFIX=backup/` stores keys under `backup//`, and an explicitly empty `S3_PREFIX` stores keys beginning with `/`. Backup, latest restore, timestamp-specific restore and retention all use this same layout, so existing backups remain accessible. Retention also uses the original timestamp prefix after switching to fixed mode.
-
-Timestamps use UTC and are captured before each database dump. To keep a fixed key per database and let S3 retain the versions:
+To discover databases at the start of every run, leave both selection variables empty and set:
 
 ```yaml
 POSTGRES_BACKUP_ALL: "true"
-BACKUP_FILENAME_MODE: fixed
-S3_PREFIX: backup
+POSTGRES_MAINTENANCE_DB: postgres
+POSTGRES_DATABASES_EXCLUDE: "scratch,test_db"
 ```
 
-```text
-backup/app/latest.dump
-backup/analytics/latest.dump
+Discovery includes `postgres` and other connectable, non-template databases, in database-name order. Newly created databases are included on the next run. Exclusions match complete names and are valid only in all-database mode. Discovery errors, permission errors and an empty selection fail the run.
+
+### Failure handling and concurrency
+
+Databases run sequentially, using the same host, port and credentials. A dump, encryption or upload failure skips retention for that database and does not prevent later databases from running. The backup command returns nonzero if any backup or retention cleanup fails. The scheduler logs the failure and remains available for subsequent runs.
+
+These are independent database snapshots, not one consistent snapshot across databases. Roles and tablespaces are not included; `pg_dumpall --globals-only` is outside this tool's scope.
+
+A container-wide lock at `/tmp/postgres-backup-s3.lock` covers discovery, dump, encryption, upload and retention. Overlapping scheduled or manual backups fail before accessing PostgreSQL or S3; they do not queue. Processes release the lock when they exit. Do not delete the lock file while backups are running. The lock does not coordinate separate containers, so use one backup writer per S3 destination.
+
+## Restore a database
+
+> [!CAUTION]
+> Restore drops and re-creates database objects. A failed restore can leave the target database partially restored.
+
+Choose one existing target database using `POSTGRES_DATABASE`, even if the container backs up multiple or all databases. Use the same S3 prefix, filename mode and passphrase as the selected backup. Other database-selection settings are ignored during restore.
+
+### Latest backup
+
+```sh
+docker compose exec -e POSTGRES_DATABASE=app backup postgres-backup-s3 restore
 ```
 
-Encryption adds `.gpg` in both modes. Fixed mode percent-encodes the database directory name (for example, `a/b` becomes `a%2Fb`) and uses `latest.dump` or `latest.dump.gpg` inside it. This keeps fixed-name backups distinct from timestamped backups even when a database name ends in a timestamp. Backup, latest restore and VersionId restore all use this layout. Use a separate `S3_PREFIX` per PostgreSQL server to avoid collisions between identically named databases.
+Timestamp mode selects the newest matching timestamp for that exact database and encryption format, across all S3 listing pages. Fixed mode downloads the current object directly.
 
-Fixed-mode keys add a separator only when needed: `S3_PREFIX=backup/` gives `backup/app/latest.dump`, while an empty prefix gives `app/latest.dump`.
+### Specific timestamp
 
-The earlier development layout `<database>.dump` for fixed mode is replaced by `<encoded-database>/latest.dump`. Existing objects and their VersionIds are not automatically migrated to the new key. If you used that development layout, retrieve old versions using their original S3 key. Before enabling timestamp cleanup, move any old flat fixed-name backups whose names could be mistaken for timestamped backups; the old layout cannot distinguish those names. Existing timestamp-mode keys and restore commands remain supported.
+The timestamp argument is supported only in timestamp mode. Set that mode explicitly when restoring an older timestamped backup after switching to fixed filenames:
 
-Fixed mode checks bucket versioning before each run and refuses to upload unless its status is `Enabled`. A failed check is also an error. The check requires bucket-level `s3:GetBucketVersioning` permission, in addition to the usual object upload permissions. S3-compatible providers must support this API and versioned objects to use fixed mode. Keep versioning enabled throughout operation; the initial check cannot prevent an administrator changing it during a run.
+```sh
+docker compose exec -e POSTGRES_DATABASE=app -e BACKUP_FILENAME_MODE=timestamp \
+  backup postgres-backup-s3 restore 2026-09-12T10:00:00
+```
+
+### Specific S3 version
+
+For fixed filenames, obtain the VersionId from the S3 console's **Show versions** view or run `aws s3api list-object-versions` outside this image:
+
+```sh
+docker compose exec -e POSTGRES_DATABASE=app -e BACKUP_FILENAME_MODE=fixed \
+  backup postgres-backup-s3 restore --version-id '<VersionId>'
+```
+
+Restore downloads and, if necessary, decrypts into temporary files before invoking `pg_restore --exit-on-error --clean --if-exists`. Download or decryption failures stop before changing the database. Allow disk space for the downloaded file and, for encrypted backups, the decrypted dump as well. Temporary files are removed on normal completion and handled failures.
+
+Without Compose, use `docker exec -e POSTGRES_DATABASE=app <container name> postgres-backup-s3 restore`. The [legacy shell entrypoints](#compatibility) also remain available.
+
+## Storage and retention
+
+### Streaming and large backups
+
+With encryption enabled, the backup pipeline is `pg_dump → GPG → S3`; otherwise it is `pg_dump → S3`. Neither plaintext nor encrypted dumps are saved locally. The upload completes only after `pg_dump` and, when enabled, GPG succeed. Producer failures abort the multipart upload and preserve the previous fixed-name backup. S3 failures stop the pipeline.
+
+Uploads buffer parts in memory and send up to two concurrently. The part size stays fixed because the final stream length is unknown in advance. Smaller backups are buffered and sent in one request. Memory usage is proportional to a few parts; larger parts require more memory.
+
+S3 permits [10,000 parts per multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html). The default limit is **8 MiB × 10,000 = 78.125 GiB per backup**, measured after compression and any encryption, not by database size on disk.
+
+| `S3_UPLOAD_PART_SIZE_MB` | Part size | Maximum uploaded data per backup |
+| --- | --- | --- |
+| `8` (default) | 8 MiB | 78.125 GiB |
+| `64` | 64 MiB | 625 GiB |
+
+Set a larger value before starting a larger backup, allowing headroom for its expected uploaded size. Parts do not grow automatically. Exceeding 10,000 parts fails and aborts the upload instead of publishing a truncated backup.
+
+S3 connections time out after 60 seconds without send or receive progress. Active transfers may run longer. After SDK retries are exhausted, the operation fails and cleanup releases the backup lock. S3 lifecycle rules can remove incomplete multipart uploads left by abrupt termination such as `SIGKILL` or a host crash.
+
+### Filenames and versioning
+
+Use a separate `S3_PREFIX` per PostgreSQL server to avoid collisions between databases with identical names.
+
+| `BACKUP_FILENAME_MODE` | Example key with `S3_PREFIX=backup` | Requirements |
+| --- | --- | --- |
+| `timestamp` (default) | `backup/app_2026-09-12T10:00:00.dump` | UTC timestamp captured before each database dump. |
+| `fixed` | `backup/app/latest.dump` | Bucket versioning must be `Enabled`. |
+
+Encryption adds `.gpg` in either mode. Fixed mode percent-encodes the database directory: `a/b` becomes `a%2Fb`. This keeps fixed keys distinct from other databases' timestamped backups.
+
+Prefix handling preserves existing object keys:
+
+| `S3_PREFIX` | Timestamp example | Fixed example |
+| --- | --- | --- |
+| `backup` | `backup/app_2026-09-12T10:00:00.dump` | `backup/app/latest.dump` |
+| `backup/` | `backup//app_2026-09-12T10:00:00.dump` | `backup/app/latest.dump` |
+| Empty | `/app_2026-09-12T10:00:00.dump` | `app/latest.dump` |
+
+Fixed mode verifies versioning before every backup run and rejects disabled, suspended or unverified versioning. S3-compatible providers must support this API and versioned objects. Keep versioning enabled throughout operation; the initial check cannot prevent later administrative changes.
 
 ### Backup retention
 
-**`BACKUP_KEEP_DAYS` controls deletion of timestamped backup files only. It does not control retention of fixed-name files or S3 version history.**
+**`BACKUP_KEEP_DAYS` deletes timestamped backups only, in either filename mode.** Switching to fixed mode leaves existing timestamped backups subject to the same retention period.
 
-| Backup object | Deleted by `BACKUP_KEEP_DAYS`? |
+| Object | Retention behavior |
 | --- | --- |
-| `app_2026-09-12T12:00:00.dump` or `.dump.gpg` | Yes, after the retention period and a successful backup of that database. |
-| `app/latest.dump` or `app/latest.dump.gpg` | No. |
-| S3 object version history | No. Manage it separately with S3 Lifecycle. |
+| `app_2026-09-12T10:00:00.dump` or `.dump.gpg` | Eligible after a successful backup of that database, when strictly older than the cutoff. |
+| `app/latest.dump` or `.dump.gpg` | Never deleted by application retention. |
+| S3 version history | Never deleted by application retention. Use S3 lifecycle rules. |
 
-Set `BACKUP_KEEP_DAYS` to a positive integer (1–36500, without leading zeros), or leave it unset to disable cleanup. Age is measured using S3 `LastModified`, with each day equal to 24 hours. Only timestamped backups strictly older than the retention cutoff at run start are deleted, after a successful backup of that database. With `BACKUP_KEEP_DAYS=7`, backups at most seven days old are retained; older ones are eligible for deletion. Other databases and unrelated objects are left alone.
+Age uses S3 `LastModified`, with a day equal to 24 hours and the cutoff captured at run start. Backups exactly on the cutoff are retained. Matching includes the complete database name and timestamp suffix; other databases and unrelated objects are left alone.
 
-The rule applies to timestamped files in **both timestamp and fixed modes**. Switching to fixed mode does not immediately delete existing timestamped backups: they remain until the configured retention period has passed.
+Deleting an expired timestamped object in a versioned bucket creates a delete marker; stored versions remain. Use lifecycle **noncurrent version expiration** to remove old versions of timestamped or fixed-name backups. Noncurrent age starts when a version becomes noncurrent, not when the backup was created. Keep the current fixed-name version unexpired to retain the latest backup.
 
-**This is a filename restriction, not a restriction to unversioned S3 buckets.** In a versioned bucket, deleting an expired timestamped file creates a delete marker; its stored versions remain. Use S3 Lifecycle noncurrent version expiration to permanently remove those versions.
+The application does not create or modify lifecycle rules. Existing rules still apply; use separate prefixes when backups need different policies. See [S3 versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) and [lifecycle rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html).
 
-To expire old fixed-name versions, configure S3 Lifecycle **noncurrent version expiration**. Its age is measured from when a version becomes noncurrent, not when the backup was created. Keep the current version unexpired to preserve the latest backup. The application does not create or modify lifecycle rules. Existing S3 lifecycle rules still apply; use separate prefixes if timestamped and fixed backups need different rules.
+### S3 permissions
 
-See [S3 versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) and [Lifecycle rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html).
+In addition to upload permissions and any bucket encryption/KMS permissions, grant the permissions needed by the selected operations:
 
-## Restore
-> [!CAUTION]
-> DATA LOSS! All database objects will be dropped and re-created.
+| Operation | Permission |
+| --- | --- |
+| Check versioning for fixed-name backups | `s3:GetBucketVersioning` on the bucket |
+| Restore the current object | `s3:GetObject` on backup objects |
+| Restore a specific VersionId | `s3:GetObjectVersion` on backup objects |
+| Find the latest timestamped backup | `s3:ListBucket` on the bucket |
+| Retention cleanup | `s3:ListBucket` on the bucket and `s3:DeleteObject` on backup objects |
+| List versions externally to choose a VersionId | `s3:ListBucketVersions` on the bucket |
 
-### ... from latest backup
+## Environment variable reference
+
+Set these variables on the **backup container** through Compose `environment:`, `docker run -e` or `docker exec -e`. Every application-specific setting and compatibility alias is listed below. `Unset` means no configured value; empty strings have the same effect unless noted. Application booleans use lowercase `"true"` or `"false"`.
+
+Image-publishing secrets belong to the GitHub repository and are listed under [publishing images](#publishing-images). Build and integration-test settings are listed under [development settings](#development-settings).
+
+### PostgreSQL connection and database selection
+
+| Variable | Default | Required / behavior |
+| --- | --- | --- |
+| `POSTGRES_HOST` | Unset | Required for backup and restore, unless the legacy host variable below is set. PostgreSQL hostname or address. |
+| `POSTGRES_PORT` | `5432` | PostgreSQL port when `POSTGRES_HOST` is set. |
+| `POSTGRES_USER` | Unset | Required for backup and restore. PostgreSQL login user. |
+| `POSTGRES_PASSWORD` | Unset | Required and nonempty for backup and restore. Passed to PostgreSQL tools as `PGPASSWORD`. |
+| `POSTGRES_DATABASE` | Unset | Single database to back up; required for restore. For backup, `POSTGRES_DATABASES` takes precedence. |
+| `POSTGRES_DATABASES` | Unset | Comma-separated backup targets. Surrounding whitespace is trimmed and duplicates are removed. |
+| `POSTGRES_BACKUP_ALL` | `false` | Discover all connectable, non-template databases. When `true`, both database-selection variables above must be empty. |
+| `POSTGRES_DATABASES_EXCLUDE` | Unset | Comma-separated, exact database names to exclude. Valid only with `POSTGRES_BACKUP_ALL=true`. |
+| `POSTGRES_MAINTENANCE_DB` | `postgres` | Database used to discover targets in all-database mode. |
+| `PGDUMP_EXTRA_OPTS` | Unset | Additional `pg_dump` arguments, split on spaces, tabs and newlines. Shell quoting, expansion and globbing are not evaluated. |
+| `POSTGRES_PORT_5432_TCP_ADDR` | Unset | Legacy Docker-link fallback for `POSTGRES_HOST`, used only when `POSTGRES_HOST` is empty. |
+| `POSTGRES_PORT_5432_TCP_PORT` | `5432` | Port used with the legacy host fallback; in that case it replaces `POSTGRES_PORT`. |
+
+A backup requires `POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or `POSTGRES_BACKUP_ALL=true`. Restore always targets `POSTGRES_DATABASE` alone.
+
+### Scheduling, encryption and retention
+
+| Variable | Default | Required / behavior |
+| --- | --- | --- |
+| `SCHEDULE` | Unset | Omit to back up immediately and exit. Otherwise use a five- or six-field cron expression or a descriptor such as `@weekly`. Applies to the `run` command only; manual `backup` runs immediately. |
+| `PASSPHRASE` | Unset | Nonempty enables streaming GPG encryption. Use the same passphrase when restoring an encrypted backup. Empty selects unencrypted `.dump` files. |
+| `BACKUP_KEEP_DAYS` | Unset | Omit to disable retention. Otherwise an integer from `1` to `36500`, without leading zeros. Deletes only expired timestamped backups after a successful backup of that database. |
+| `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` or `fixed`. Fixed mode requires bucket versioning to be `Enabled`; version-history retention is managed by S3 lifecycle rules. |
+
+### S3 destination and credentials
+
+| Variable | Default | Required / behavior |
+| --- | --- | --- |
+| `S3_BUCKET` | Unset | Required bucket name for backup and restore. |
+| `S3_REGION` | `us-west-1` | Region used by the application. Takes precedence over AWS region environment variables and profile settings. |
+| `S3_PREFIX` | `backup` | Object-key prefix. An explicitly empty value is preserved; timestamp keys then start with `/`. Trailing slashes are preserved according to the [filename-mode rules](#filenames-and-versioning). |
+| `S3_ENDPOINT` | Unset | Custom `http://` or `https://` S3 endpoint. Uses path-style addressing. Do not include URL credentials, a query or a fragment. Takes precedence over SDK endpoint settings. |
+| `S3_ACCESS_KEY_ID` | Unset | Overrides `AWS_ACCESS_KEY_ID` / `AWS_ACCESS_KEY` when nonempty. Optional when using the default credential chain. |
+| `S3_SECRET_ACCESS_KEY` | Unset | Overrides `AWS_SECRET_ACCESS_KEY` / `AWS_SECRET_KEY` when nonempty. |
+| `S3_SESSION_TOKEN` | Unset | Optional temporary-credential token; overrides `AWS_SESSION_TOKEN` when nonempty. |
+| `S3_UPLOAD_PART_SIZE_MB` | `8` | Integer from `5` to `5120`, in **MiB**. Larger parts increase the maximum streamed backup size and memory usage. See [streaming and large backups](#streaming-and-large-backups). |
+| `S3_S3V4` | `no` | Legacy compatibility variable, ignored by the Go implementation. Requests already use Signature Version 4. |
+| `AWS_ACCESS_KEY_ID` | Unset | Standard AWS access key, used when no S3 access-key override is set. |
+| `AWS_SECRET_ACCESS_KEY` | Unset | Standard AWS secret key, used when no S3 secret-key override is set. |
+| `AWS_SESSION_TOKEN` | Unset | Session token for temporary AWS credentials. |
+| `AWS_ACCESS_KEY` | Unset | Legacy fallback for `AWS_ACCESS_KEY_ID`. |
+| `AWS_SECRET_KEY` | Unset | Legacy fallback for `AWS_SECRET_ACCESS_KEY`. |
+
+If any `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` or `S3_SESSION_TOKEN` override is set, a complete access-key/secret-key pair must be available from the `S3_*` and/or `AWS_*` environment variables. These overrides are not merged with credentials from profiles or IAM roles. With no S3 overrides, the AWS SDK uses its default credential chain.
+
+### Additional SDK and client settings
+
+The AWS SDK and PostgreSQL/GPG tools also read their own environment variables. Common operational settings are listed here; the linked upstream references describe further dependency-specific options and their version-dependent support.
+
+| Variable | Default / behavior |
+| --- | --- |
+| `AWS_PROFILE`, `AWS_DEFAULT_PROFILE` | Select a shared AWS profile; `AWS_PROFILE` takes precedence. The default profile is `default`. Mount the corresponding credential/config files into the container. |
+| `AWS_SHARED_CREDENTIALS_FILE` | Shared credential file path; normally `~/.aws/credentials`. |
+| `AWS_CONFIG_FILE` | Shared configuration file path; normally `~/.aws/config`. |
+| `AWS_REGION`, `AWS_DEFAULT_REGION` | Standard SDK region variables; the application supplies `S3_REGION` explicitly, so use `S3_REGION` to change its region. |
+| `AWS_CA_BUNDLE` | Optional PEM CA bundle for AWS HTTPS connections. The file must exist inside the container. |
+| `AWS_MAX_ATTEMPTS` | SDK retry-attempt limit, including the initial request. |
+| `AWS_RETRY_MODE` | SDK retry strategy, such as `standard` or `adaptive`. |
+| `AWS_REQUEST_CHECKSUM_CALCULATION`, `AWS_RESPONSE_CHECKSUM_VALIDATION` | SDK checksum policy: `WHEN_SUPPORTED` or `WHEN_REQUIRED`. |
+| `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` | SDK-wide or S3-specific endpoint override when `S3_ENDPOINT` is unset. |
+| `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` | Set to `true` to ignore SDK environment/profile endpoint overrides. Does not override an explicit `S3_ENDPOINT`. |
+| `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_SESSION_NAME` | Web-identity role configuration; commonly supplied by a workload platform. The token file must be available inside the container. |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI` | Container credential-provider endpoints, normally supplied by the hosting platform. |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | Authorization for a container credential endpoint, when required by the platform. |
+| `AWS_EC2_METADATA_DISABLED` | Set to `true` to disable EC2 instance-metadata credential discovery. |
+| `PGCONNECT_TIMEOUT` | PostgreSQL connection timeout in seconds; inherited by `psql`, `pg_dump` and `pg_restore`. |
+| `PGSSLMODE` | PostgreSQL TLS mode, for example `require` or `verify-full`. |
+| `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | PostgreSQL CA certificate, client certificate and private-key paths inside the container. |
+| `PGOPTIONS`, `PGAPPNAME` | Extra PostgreSQL session options and application name. |
+| `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD` | Do not use these as substitutes for the required `POSTGRES_*` settings: connection arguments are supplied explicitly, and `PGPASSWORD` is overwritten with `POSTGRES_PASSWORD`. |
+| `TZ` | Local timezone for scheduling, normally UTC in the image. `CRON_TZ=...` inside `SCHEDULE` overrides the schedule timezone; `CRON_TZ` is not a separate application environment variable. Backup timestamps remain UTC. |
+| `TMPDIR` | Restore temporary-file directory; `/tmp` when unset. Streaming backups do not save dumps there. The backup lock remains at `/tmp/postgres-backup-s3.lock`. |
+| `GNUPGHOME` | GPG configuration/keyring directory; normally `~/.gnupg`. |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | HTTP/HTTPS proxy configuration for the SDK's HTTP client; lowercase equivalents are also supported. |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Optional certificate-file/directory overrides for Go's system certificate pool on Linux. |
+
+See the [AWS SDK environment-variable reference](https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html) and the [PostgreSQL client environment-variable reference](https://www.postgresql.org/docs/17/libpq-envars.html). PostgreSQL options depend on the client major version in the selected image.
+
+## Publishing images
+
+The [GitHub Actions workflow](.github/workflows/build-and-push-images.yml) runs regression tests and Docker integration tests before building the PostgreSQL image matrix. Pushes to `master` publish to GHCR by default. Pull requests build and test without registry login or publishing.
+
+### GHCR
+
+The workflow uses the lowercase `github.repository` value for `ghcr.io/<owner>/<repository>:<postgres-version>`. Forks therefore publish under their own repository automatically. No Docker Hub account or manually created token is required.
+
+1. On a fork, enable workflows in the repository's **Actions** tab.
+2. Push to `master` and wait for the test and publish jobs to succeed.
+3. For anonymous pulls, change the new package's visibility to **Public** in its package settings. GHCR packages are [private on first publication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images), even when the repository is public.
+
 ```sh
-docker exec <container name> sh restore.sh
+docker pull ghcr.io/ajctrl/postgres-backup-s3:17
 ```
 
-For a container backing up multiple or all databases, explicitly choose the single existing database to restore. Backup selection settings are ignored during restore:
+### Optional Docker Hub publishing
 
-```sh
-docker exec -e POSTGRES_DATABASE=app <container name> sh restore.sh
-```
+To publish the same build to Docker Hub as well, add both credentials under **Settings → Secrets and variables → Actions → Repository secrets**. The destination becomes `docker.io/<DOCKERHUB_USERNAME>/<repository>:<postgres-version>`, with lowercase names.
 
-Use the same filename mode, prefix and passphrase as the backup. Timestamp mode lists all pages of objects and selects the newest matching timestamp for that exact database and encryption format. Fixed mode downloads the current version directly.
+If either credential is missing, Docker Hub login and publishing are skipped. Configured but invalid credentials fail the job; correct or remove them to proceed.
 
-### ... from specific backup
-```sh
-docker exec <container name> sh restore.sh <timestamp>
-```
+| Setting | Where it comes from | Required / behavior |
+| --- | --- | --- |
+| `GITHUB_TOKEN` | Automatically supplied by GitHub Actions as `secrets.GITHUB_TOKEN` | Used to publish to GHCR. **Do not create or register it manually.** The workflow grants `packages: write` to the publishing job. |
+| `DOCKERHUB_USERNAME` | Optional repository secret | Docker Hub username. Additional Docker Hub publishing is enabled only when this and `DOCKERHUB_TOKEN` are both nonempty. |
+| `DOCKERHUB_TOKEN` | Optional repository secret | Docker Hub access token with push permission. Not needed for GHCR-only publishing. |
+| `GITHUB_REPOSITORY`, `GITHUB_OUTPUT` | Built-in Actions environment variables | Supplied automatically for image naming and step outputs; no manual configuration. |
+| `POSTGRES_VERSION`, `DOCKERHUB_ENABLED` | Internal step environment variables | Computed by the workflow from its matrix, event and secrets; not user-configurable repository settings. |
 
-The timestamp argument is supported in timestamp mode only.
+There are no required repository **Variables** entries. Only the publishing job receives `packages: write` for its automatic `GITHUB_TOKEN`.
 
-### ... from an S3 object version
+## Development
 
-In fixed mode, obtain the object's VersionId from the S3 console's **Show versions** view or `aws s3api list-object-versions`, then run:
+Use Go 1.26 or later on Linux. The race detector requires a C compiler; production builds disable CGO.
 
-```sh
-docker exec -e POSTGRES_DATABASE=app <container name> sh restore.sh --version-id '<VersionId>'
-```
-
-Previous-version downloads require object-level `s3:GetObjectVersion`; latest downloads require `s3:GetObject`. Listing versions through the API requires bucket-level `s3:ListBucketVersions`. Timestamp-mode restore lookup requires `s3:ListBucket`. Retention cleanup in either filename mode requires `s3:ListBucket` and `s3:DeleteObject`. These are in addition to any encryption/KMS permissions required by your bucket.
-
-Download or decryption failures stop before `pg_restore`. Restore errors return a nonzero status and can leave a partially restored database. To restore a timestamped backup after switching to fixed mode, also pass `-e BACKUP_FILENAME_MODE=timestamp` to `docker exec`.
-
-# Development
-## Run regression tests
-
-Use Go 1.26 or later on Linux. The race detector also requires a C compiler for development; the production executable is built with CGO disabled.
+### Tests
 
 ```sh
 go test -count=1 -race ./...
 go vet ./...
 ```
 
-Use `-count=1` to disable test result caching: changes to the CLI built by the tests or to a Docker image are not tracked as test dependencies.
+`-count=1` prevents stale results: the CLI built by the tests and externally built Docker images are not tracked as test dependencies. Regression tests use local HTTP servers and fake PostgreSQL/GPG commands, without AWS credentials.
 
-For a real database, GPG and S3-compatible storage round trip, build the image and run the opt-in Docker integration suite:
+For actual PostgreSQL, GPG and MinIO round trips, use a local Docker daemon:
 
 ```sh
 docker build -t postgres-backup-s3:go-migration .
 go test -count=1 -tags=integration -v -timeout=15m ./tests/integration
 ```
 
-This requires a local Docker daemon. The suite creates disposable PostgreSQL and MinIO containers, checks plaintext timestamp backup/restore and encrypted fixed-name backups with previous-VersionId restore, then removes its containers and network. It also runs encrypted backups twice in one container to check lock release while the GPG agent remains running. A multipart encrypted backup runs with an unwritable temporary directory, followed by a restore that verifies the row count and a checksum of all values. It uses isolated test credentials and does not contact AWS. `BACKUP_TEST_IMAGE`, `POSTGRES_TEST_IMAGE` and `S3_TEST_IMAGE` override the default images (`postgres-backup-s3:go-migration`, `postgres:17` and the MinIO image pinned by digest in [the integration test](tests/integration/docker_test.go)).
+The integration suite creates and removes disposable containers and a network. It checks plaintext restore, encrypted fixed-name version restore, repeated backups with a surviving GPG agent, and a multipart encrypted backup with an unwritable temporary directory. The latter restore checks row count and a checksum of all values. Tests use isolated credentials and do not contact AWS.
 
-Tests cover configuration, database selection, backup/restore orchestration, retention and S3 behavior without requiring AWS credentials. Go interfaces and local test servers allow failure paths and pagination to be exercised without external services. The GitHub Actions workflow runs race checks and vet, then the Docker integration suite, on pushes and pull requests. Both test jobs must pass before the PostgreSQL image matrix builds. Registry authentication and publishing occur only on pushes to `master`.
+### Local executable
 
-To run locally, install the PostgreSQL client tools and GPG, configure the same environment variables used by Docker, then build and execute:
+Install PostgreSQL client tools and GPG, set the runtime environment variables, then run:
 
 ```sh
 go build -o /tmp/postgres-backup-s3 ./cmd/postgres-backup-s3
 /tmp/postgres-backup-s3 backup
 ```
 
-## Build the image locally
+### Docker builds
 
-The multistage build compiles a stripped, static Go executable for the target architecture; the compiler and module cache stay in the build stage. The default image uses Alpine 3.21 and PostgreSQL client 17:
+The multistage build produces a stripped, static Go executable. The compiler and module cache stay in the build stage. The default runtime uses Alpine 3.21 and PostgreSQL client 17.
 
 ```sh
 docker build -t postgres-backup-s3:local .
 docker buildx build --platform linux/amd64,linux/arm64 --build-arg ALPINE_VERSION=3.21 .
 ```
 
-`ALPINE_VERSION` determines the PostgreSQL client major version. The existing compatibility mapping is preserved:
+`ALPINE_VERSION` controls the PostgreSQL client major version:
 
-| PostgreSQL image tag | Alpine version |
+| PostgreSQL tag | Alpine version |
 | --- | --- |
 | `12` | `3.12` |
 | `13` | `3.14` |
@@ -223,32 +370,46 @@ docker buildx build --platform linux/amd64,linux/arm64 --build-arg ALPINE_VERSIO
 | `16` | `3.19` |
 | `17` | `3.21` |
 
-These older Alpine releases are retained to avoid silently changing the client major version for existing tags; several are outside normal support. Updating the supported PostgreSQL versions and base OS policy is a separate change. Alpine 3.12 and 3.14 package GPG as `gnupg`; newer images install only `gpg` and `gpg-agent`. See [`build-and-push-images.yml`](.github/workflows/build-and-push-images.yml) for the build matrix and [Alpine's release support table](https://alpinelinux.org/releases/) for base OS status.
+Older Alpine releases preserve existing PostgreSQL tags; several are outside normal support. See [Alpine's support table](https://alpinelinux.org/releases/). Alpine 3.12 and 3.14 install `gnupg`; newer images use `gpg` and `gpg-agent`.
 
-## Run a simple test environment with Docker Compose
+### Development settings
+
+| Variable / argument | Default | Scope |
+| --- | --- | --- |
+| `BACKUP_TEST_IMAGE` | `postgres-backup-s3:go-migration` | Environment variable for the Docker integration test. |
+| `POSTGRES_TEST_IMAGE` | `postgres:17` | Environment variable for the Docker integration test's PostgreSQL image. |
+| `S3_TEST_IMAGE` | MinIO image pinned by digest in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's S3 fixture. |
+| `ALPINE_VERSION` | `3.21` | Docker **build argument**, not a runtime environment variable. Selects the PostgreSQL client version. |
+| `GO_VERSION` | `1.26` | Docker **build argument** selecting the builder's Go version. |
+| `BUILDPLATFORM`, `TARGETOS`, `TARGETARCH` | Supplied by Docker BuildKit | Build-platform inputs; select target architectures with `docker buildx build --platform`. |
+
+### Repository Compose fixture
+
+The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 14 backup image and starts a development PostgreSQL server. It still needs an S3 bucket and credentials:
+
 ```sh
 cp template.env .env
-# fill out your secrets/params in .env
-docker compose up -d
+# Fill in S3_REGION, S3_BUCKET and credentials in .env.
+docker compose up -d --build
+docker compose exec backup postgres-backup-s3 backup
 ```
 
-# Acknowledgements
-This project is a fork and re-structuring of @schickling's [postgres-backup-s3](https://github.com/schickling/dockerfiles/tree/master/postgres-backup-s3) and [postgres-restore-s3](https://github.com/schickling/dockerfiles/tree/master/postgres-restore-s3).
+## Compatibility
 
-## Fork goals
-These changes would have been difficult or impossible merge into @schickling's repo or similarly-structured forks.
-  - dedicated repository
-  - automated builds
-  - support multiple PostgreSQL versions
-  - backup and restore with one image
+The Go implementation preserves existing runtime configuration, timestamp keys, `.dump` / `.dump.gpg` formats and shell entrypoints:
 
-## Other changes and features
-  - some environment variables renamed or removed
-  - uses `pg_dump`'s `custom` format (see [docs](https://www.postgresql.org/docs/10/app-pgdump.html))
-  - drop and re-create all database objects on restore
-  - backup blobs and all schemas by default
-  - Go orchestration and AWS SDK for Go v2, with no Python runtime
-  - filter backups on S3 by database name
-  - support encrypted (password-protected) backups
-  - support for restoring from a specific backup by timestamp
-  - support for auto-removal of expired timestamped backups in both filename modes
+| Legacy entrypoint | Equivalent command |
+| --- | --- |
+| `sh run.sh` | `postgres-backup-s3 run` |
+| `sh backup.sh` | `postgres-backup-s3 backup` |
+| `sh restore.sh [arguments]` | `postgres-backup-s3 restore [arguments]` |
+
+Requests use Signature Version 4; `S3_S3V4` is accepted but has no effect. `PGDUMP_EXTRA_OPTS` remains a whitespace-separated argument list, not shell code.
+
+The early development fixed-key layout `<database>.dump` has been replaced by `<encoded-database>/latest.dump`. Old objects and VersionIds are not migrated: retrieve them using their original S3 keys. Before enabling timestamp cleanup, move old flat fixed-name backups whose names resemble timestamped dumps. Existing timestamp keys and restore arguments remain supported.
+
+## Acknowledgements and license
+
+This project builds on [alexanderbartels/postgres-backup-s3](https://github.com/alexanderbartels/postgres-backup-s3) and Johannes Schickling's [postgres-backup-s3](https://github.com/schickling/dockerfiles/tree/master/postgres-backup-s3) and [postgres-restore-s3](https://github.com/schickling/dockerfiles/tree/master/postgres-restore-s3).
+
+[MIT License](LICENSE.txt).
