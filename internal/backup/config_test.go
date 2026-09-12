@@ -61,7 +61,7 @@ func TestSelectionAndRetentionValidation(t *testing.T) {
 	}
 }
 
-func TestNamesAndKeysPreserveExistingLayout(t *testing.T) {
+func TestNamesAndKeys(t *testing.T) {
 	for name, encoded := range map[string]string{
 		"a/b": "a%2Fb", "a%2Fb": "a%252Fb", "a'b": "a%27b", "with space": "with%20space",
 		"host=other": "host%3Dother", "$(oops)*": "%24%28oops%29%2A", "日本語": "%E6%97%A5%E6%9C%AC%E8%AA%9E",
@@ -74,15 +74,21 @@ func TestNamesAndKeysPreserveExistingLayout(t *testing.T) {
 		{"backup", "backup/", "backup/"}, {"backup/", "backup//", "backup/"},
 		{"backup//", "backup///", "backup//"}, {"", "/", ""}, {"/", "//", ""},
 	} {
-		c := Config{Prefix: tc.prefix, FilenameMode: "timestamp"}
 		date := time.Date(2026, 9, 12, 12, 30, 0, 0, time.FixedZone("plus2", 2*3600))
-		if got := c.backupKey("app", date); got != tc.timestampPrefix+"app_2026-09-12T10:30:00.dump" {
-			t.Errorf("timestamp prefix %q: %q", tc.prefix, got)
-		}
-		c.FilenameMode, c.Passphrase = "fixed", "secret"
-		for name, directory := range map[string]string{"app": "app", "a/b": "a%2Fb", ".": "%2E", "..": "%2E%2E"} {
-			if got := c.backupKey(name, date); got != tc.fixedPrefix+directory+"/latest.dump.gpg" {
-				t.Errorf("fixed key %q/%q: %q", tc.prefix, name, got)
+		for name, component := range map[string]string{"app": "app", "a/b": "a%2Fb", "a%2Fb": "a%252Fb", ".": "%2E", "..": "%2E%2E"} {
+			for _, passphrase := range []string{"", "secret"} {
+				c := Config{Prefix: tc.prefix, FilenameMode: "timestamp", Passphrase: passphrase}
+				suffix := ".dump"
+				if passphrase != "" {
+					suffix += ".gpg"
+				}
+				if got := c.backupKey(name, date); got != tc.timestampPrefix+component+"/2026-09-12T10:30:00"+suffix {
+					t.Errorf("timestamp key %q/%q: %q", tc.prefix, name, got)
+				}
+				c.FilenameMode = "fixed"
+				if got := c.backupKey(name, date); got != tc.fixedPrefix+component+suffix {
+					t.Errorf("fixed key %q/%q: %q", tc.prefix, name, got)
+				}
 			}
 		}
 	}

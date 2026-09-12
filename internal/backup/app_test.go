@@ -34,18 +34,18 @@ func (s *recordingStore) Delete(_ context.Context, key string) error {
 func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 	cutoff := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	expired := []storage.Object{
-		{Key: "backup/app_2026-09-05T11:59:59.dump", LastModified: cutoff.Add(-time.Second)},
-		{Key: "backup/app_2026-09-05T11:59:59.dump.gpg", LastModified: cutoff.Add(-time.Nanosecond)},
+		{Key: "backup/app/2026-09-05T11:59:59.dump", LastModified: cutoff.Add(-time.Second)},
+		{Key: "backup/app/2026-09-05T11:59:59.dump.gpg", LastModified: cutoff.Add(-time.Nanosecond)},
 	}
 	objects := append([]storage.Object{}, expired...)
 	objects = append(objects,
-		storage.Object{Key: "backup/app_2026-09-05T12:00:00.dump", LastModified: cutoff},
-		storage.Object{Key: "backup/app_2026-09-05T12:00:01.dump.gpg", LastModified: cutoff.Add(time.Nanosecond)},
+		storage.Object{Key: "backup/app/2026-09-05T12:00:00.dump", LastModified: cutoff},
+		storage.Object{Key: "backup/app/2026-09-05T12:00:01.dump.gpg", LastModified: cutoff.Add(time.Nanosecond)},
 	)
 	for _, key := range []string{
-		"backup/app/latest.dump", "backup/app/latest.dump.gpg", "backup/app_extra_2000-01-01T00:00:00.dump",
-		"backup/app_2000-01-01T00%3A00%3A00/latest.dump", "backup/other_2000-01-01T00:00:00.dump",
-		"backup/app_notes.dump", "backup/app_2000-01-01T00:00:00.dump.extra", "backup/app_2000-01-01T00:00:00.dump\n",
+		"backup/app.dump", "backup/app.dump.gpg", "backup/app_extra/2000-01-01T00:00:00.dump",
+		"backup/app/2000-01-01T00%3A00%3A00/latest.dump", "backup/other/2000-01-01T00:00:00.dump",
+		"backup/app/notes.dump", "backup/app/latest.dump", "backup/app_2000-01-01T00:00:00.dump", "backup/app/2000-01-01T00:00:00.dump.extra", "backup/app/2000-01-01T00:00:00.dump\n",
 	} {
 		objects = append(objects, storage.Object{Key: key, LastModified: cutoff.Add(-time.Hour)})
 	}
@@ -55,7 +55,7 @@ func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 		if err := a.removeOldBackups(context.Background(), "app", cutoff); err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(s.deleted, []string{expired[0].Key, expired[1].Key}) || s.prefix != "backup/app_" {
+		if !reflect.DeepEqual(s.deleted, []string{expired[0].Key, expired[1].Key}) || s.prefix != "backup/app/" {
 			t.Errorf("mode %s: deleted %v, prefix %q", mode, s.deleted, s.prefix)
 		}
 	}
@@ -63,7 +63,7 @@ func TestRetentionBoundaryAndExactMatching(t *testing.T) {
 
 func TestRetentionNeverDeletesAfterIncompleteListing(t *testing.T) {
 	for _, s := range []*recordingStore{
-		{objects: []storage.Object{{Key: "backup/app_2000-01-01T00:00:00.dump"}}},
+		{objects: []storage.Object{{Key: "backup/app/2000-01-01T00:00:00.dump"}}},
 		{listErr: errors.New("second page failed")},
 	} {
 		a := New(Config{Prefix: "backup"}, s, io.Discard, io.Discard)

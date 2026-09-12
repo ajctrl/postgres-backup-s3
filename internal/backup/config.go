@@ -154,18 +154,24 @@ func (c Config) fileType() string {
 	return ".dump"
 }
 
-func (c Config) timestampPrefix(database string) string { return c.Prefix + "/" + database + "_" }
+func (c Config) timestampPrefix(database string) string {
+	return c.Prefix + "/" + databaseKeyComponent(database) + "/"
+}
 
 func (c Config) fixedKey(database string) string {
 	prefix := strings.TrimSuffix(c.Prefix, "/")
 	if prefix != "" {
 		prefix += "/"
 	}
-	directory := encodeComponent(database)
-	if directory == "." || directory == ".." {
-		directory = strings.ReplaceAll(directory, ".", "%2E")
+	return prefix + databaseKeyComponent(database) + c.fileType()
+}
+
+func databaseKeyComponent(database string) string {
+	component := encodeComponent(database)
+	if component == "." || component == ".." {
+		component = strings.ReplaceAll(component, ".", "%2E")
 	}
-	return prefix + directory + "/latest" + c.fileType()
+	return component
 }
 
 func (c Config) backupKey(database string, now time.Time) string {

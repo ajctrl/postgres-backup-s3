@@ -130,7 +130,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "timestamp"}
 		// Exercise the default CMD as well as the legacy restore wrapper.
 		runBackupImage(t, env)
-		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("timestamp/app_")})
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("timestamp/app/")})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +155,7 @@ func TestDockerBackupRestore(t *testing.T) {
 	}
 	t.Run("fixed_encrypted_versions", func(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "fixed/", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
-		key := "fixed/app/latest.dump.gpg"
+		key := "fixed/app.dump.gpg"
 		version := func() string {
 			t.Helper()
 			object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
@@ -194,7 +194,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 		// /proc cannot hold temporary dump files. Only streaming can succeed here.
 		runBackupImage(t, env, "postgres-backup-s3", "backup")
-		object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("streaming/app/latest.dump.gpg")})
+		object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("streaming/app.dump.gpg")})
 		if err != nil {
 			t.Fatal(err)
 		}

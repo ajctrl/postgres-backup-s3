@@ -155,18 +155,18 @@ Use a separate `S3_PREFIX` per PostgreSQL server to avoid collisions between dat
 
 | `BACKUP_FILENAME_MODE` | Example key with `S3_PREFIX=backup` | Requirements |
 | --- | --- | --- |
-| `timestamp` (default) | `backup/app_2026-09-12T10:00:00.dump` | UTC timestamp captured before each database dump. |
-| `fixed` | `backup/app/latest.dump` | Bucket versioning must be `Enabled`. |
+| `timestamp` (default) | `backup/app/2026-09-12T10:00:00.dump` | UTC timestamp captured before each database dump. |
+| `fixed` | `backup/app.dump` | Bucket versioning must be `Enabled`. |
 
-Encryption adds `.gpg` in either mode. Fixed mode percent-encodes the database directory: `a/b` becomes `a%2Fb`. This keeps fixed keys distinct from other databases' timestamped backups.
+Encryption adds `.gpg` in either mode. Both modes percent-encode the database name: `a/b` becomes `a%2Fb`. Timestamp mode stores backups in a database directory; fixed mode stores `<encoded-database>.dump` directly under the prefix. This keeps fixed keys separate from timestamped backups.
 
-Prefix handling preserves existing object keys:
+Prefix separator handling remains unchanged:
 
 | `S3_PREFIX` | Timestamp example | Fixed example |
 | --- | --- | --- |
-| `backup` | `backup/app_2026-09-12T10:00:00.dump` | `backup/app/latest.dump` |
-| `backup/` | `backup//app_2026-09-12T10:00:00.dump` | `backup/app/latest.dump` |
-| Empty | `/app_2026-09-12T10:00:00.dump` | `app/latest.dump` |
+| `backup` | `backup/app/2026-09-12T10:00:00.dump` | `backup/app.dump` |
+| `backup/` | `backup//app/2026-09-12T10:00:00.dump` | `backup/app.dump` |
+| Empty | `/app/2026-09-12T10:00:00.dump` | `app.dump` |
 
 Fixed mode checks versioning before every backup run and rejects disabled or suspended versioning. If `GetBucketVersioning` returns `AccessDenied` (HTTP 403), it logs a warning to stderr and continues the backup without verifying versioning. Other verification errors stop the backup. When the check is denied, ensure versioning is enabled to retain previous fixed-name backups. S3-compatible providers must support versioned objects. Keep versioning enabled throughout operation; the initial check cannot prevent later administrative changes.
 
@@ -176,8 +176,8 @@ Fixed mode checks versioning before every backup run and rejects disabled or sus
 
 | Object | Retention behavior |
 | --- | --- |
-| `app_2026-09-12T10:00:00.dump` or `.dump.gpg` | Eligible after a successful backup of that database, when strictly older than the cutoff. |
-| `app/latest.dump` or `.dump.gpg` | Never deleted by application retention. |
+| `app/2026-09-12T10:00:00.dump` or `.dump.gpg` | Eligible after a successful backup of that database, when strictly older than the cutoff. |
+| `app.dump` or `.dump.gpg` | Never deleted by application retention. |
 | S3 version history | Never deleted by application retention. Use S3 lifecycle rules. |
 
 Age uses S3 `LastModified`, with a day equal to 24 hours and the cutoff captured at run start. Backups exactly on the cutoff are retained. Matching includes the complete database name and timestamp suffix; other databases and unrelated objects are left alone.
@@ -397,7 +397,7 @@ docker compose exec backup postgres-backup-s3 backup
 
 ## Compatibility
 
-The Go implementation preserves existing runtime configuration, timestamp keys, `.dump` / `.dump.gpg` formats and shell entrypoints:
+The Go implementation preserves existing runtime configuration, `.dump` / `.dump.gpg` formats and shell entrypoints:
 
 | Legacy entrypoint | Equivalent command |
 | --- | --- |
@@ -407,7 +407,7 @@ The Go implementation preserves existing runtime configuration, timestamp keys, 
 
 Requests use Signature Version 4; `S3_S3V4` is accepted but has no effect. `PGDUMP_EXTRA_OPTS` remains a whitespace-separated argument list, not shell code.
 
-The early development fixed-key layout `<database>.dump` has been replaced by `<encoded-database>/latest.dump`. Old objects and VersionIds are not migrated: retrieve them using their original S3 keys. Before enabling timestamp cleanup, move old flat fixed-name backups whose names resemble timestamped dumps. Existing timestamp keys and restore arguments remain supported.
+The key layout is now `<encoded-database>.dump` for fixed mode and `<encoded-database>/<timestamp>.dump` for timestamp mode, relative to the configured prefix (with `.gpg` added for encryption). Previous `<encoded-database>/latest.dump` fixed objects and flat `<database>_<timestamp>.dump` timestamped objects are not migrated or selected by restore or retention. Retrieve those backups and their VersionIds using their original S3 keys. Restore arguments remain unchanged.
 
 ## Acknowledgements and license
 

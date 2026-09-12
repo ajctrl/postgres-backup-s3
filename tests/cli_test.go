@@ -400,7 +400,7 @@ func TestBackupSingleDatabaseAndLiteralNames(t *testing.T) {
 			assertEqual(t, f.databaseCalls("pg_dump"), []string{name})
 			calls := f.s3.calls("PUT")
 			assertEqual(t, len(calls), 1)
-			pattern := "^" + regexp.QuoteMeta("backup/"+name+"_") + `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.dump$`
+			pattern := "^" + regexp.QuoteMeta("backup/"+strings.ReplaceAll(url.QueryEscape(name), "+", "%20")+"/") + `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.dump$`
 			if !regexp.MustCompile(pattern).MatchString(calls[0].Key) {
 				t.Fatalf("unexpected timestamp key: %q", calls[0].Key)
 			}
@@ -444,7 +444,7 @@ func TestUnsetRetentionDoesNotListOrDeleteExistingObjects(t *testing.T) {
 					f.env["BACKUP_KEEP_DAYS"] = ""
 				}
 				f.s3.fail = "list"
-				f.s3.objects = []object{{Key: "backup/app_2000-01-01T00:00:00.dump", LastModified: "2000-01-01T00:00:00Z"}}
+				f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00.dump", LastModified: "2000-01-01T00:00:00Z"}}
 				f.run(true, "backup")
 				assertEqual(t, len(f.s3.calls("PUT")), 2)
 				assertEqual(t, len(f.s3.calls("list")), 0)
@@ -537,7 +537,7 @@ func TestFixedKeysEncodingEncryptionAndVersionRestore(t *testing.T) {
 				if encrypted {
 					f.env["PASSPHRASE"], suffix = "test-passphrase", ".dump.gpg"
 				}
-				key := "backup/" + tc.directory + "/latest" + suffix
+				key := "backup/" + tc.directory + suffix
 				f.run(true, "backup")
 				assertEqual(t, keys(f.s3.calls("PUT")), []string{key})
 				assertEqual(t, len(f.s3.calls("versioning")), 1)
@@ -595,7 +595,7 @@ func TestFixedBackupContinuesWhenVersioningAccessDenied(t *testing.T) {
 	}
 	assertEqual(t, len(f.s3.calls("versioning")), 1)
 	assertEqual(t, f.databaseCalls("pg_dump"), []string{"app", "billing"})
-	assertEqual(t, keys(f.s3.calls("PUT")), []string{"backup/app/latest.dump", "backup/billing/latest.dump"})
+	assertEqual(t, keys(f.s3.calls("PUT")), []string{"backup/app.dump", "backup/billing.dump"})
 }
 
 func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
@@ -620,7 +620,7 @@ func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
 				assertEqual(t, f.databaseCalls("pg_dump"), []string{"app", "billing"})
 				lists := f.s3.calls("list")
 				assertEqual(t, len(lists), 1)
-				assertEqual(t, lists[0].Query.Get("prefix"), "backup/billing_")
+				assertEqual(t, lists[0].Query.Get("prefix"), "backup/billing/")
 				uploads := f.s3.calls("PUT")
 				want := 1
 				if stage == "upload" {
@@ -641,15 +641,15 @@ func TestRetentionOnlyDeletesExpiredExactTimestampKeys(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			f := newFixture(t)
 			f.env["POSTGRES_DATABASE"], f.env["BACKUP_FILENAME_MODE"], f.env["BACKUP_KEEP_DAYS"] = "app", mode, "7"
-			expired := []string{"backup/app_2000-01-01T00:00:00.dump", "backup/app_2000-01-01T00:00:01.dump.gpg"}
+			expired := []string{"backup/app/2000-01-01T00:00:00.dump", "backup/app/2000-01-01T00:00:01.dump.gpg"}
 			for _, key := range expired {
 				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: old})
 			}
-			f.s3.objects = append(f.s3.objects, object{Key: "backup/app_2000-01-01T00:00:02.dump", LastModified: recent})
+			f.s3.objects = append(f.s3.objects, object{Key: "backup/app/2000-01-01T00:00:02.dump", LastModified: recent})
 			for _, key := range []string{
-				"backup/app/latest.dump", "backup/app/latest.dump.gpg", "backup/app_other_2000-01-01T00:00:00.dump",
-				"backup/app_2000-01-01T00%3A00%3A00/latest.dump", "backup/other_2000-01-01T00:00:00.dump",
-				"backup/app_notes.dump", "backup/app_2000-01-01T00:00:00.dump.extra", "backup/app_2000-01-01T00:00:00.dump\n",
+				"backup/app.dump", "backup/app.dump.gpg", "backup/app_other_2000-01-01T00:00:00.dump",
+				"backup/app/2000-01-01T00%3A00%3A00/latest.dump", "backup/other/2000-01-01T00:00:00.dump",
+				"backup/app/notes.dump", "backup/app/latest.dump", "backup/app_2000-01-01T00:00:00.dump", "backup/app/2000-01-01T00:00:00.dump.extra", "backup/app/2000-01-01T00:00:00.dump\n",
 			} {
 				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: old})
 			}
@@ -665,7 +665,7 @@ func TestRetentionFailuresReportErrorAndContinue(t *testing.T) {
 			f := newFixture(t)
 			f.env["POSTGRES_DATABASES"], f.env["BACKUP_KEEP_DAYS"] = "app,billing", "7"
 			f.s3.fail = stage
-			f.s3.objects = []object{{Key: "backup/app_2000-01-01T00:00:00.dump", LastModified: "2000-01-01T00:00:00Z"}}
+			f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00.dump", LastModified: "2000-01-01T00:00:00Z"}}
 			output := f.run(false, "backup")
 			if !strings.Contains(output, "2 succeeded, 0 failed") {
 				t.Fatalf("incorrect backup summary after retention failure: %s", output)
@@ -675,7 +675,7 @@ func TestRetentionFailuresReportErrorAndContinue(t *testing.T) {
 	}
 }
 
-func TestPrefixLayoutsStayCompatible(t *testing.T) {
+func TestPrefixLayouts(t *testing.T) {
 	for _, tc := range []struct{ prefix, timestamp, fixed string }{
 		{"backup/", "backup//", "backup/"}, {"backup//", "backup///", "backup//"}, {"", "/", ""}, {"/", "//", ""},
 	} {
@@ -684,18 +684,18 @@ func TestPrefixLayoutsStayCompatible(t *testing.T) {
 				f := newFixture(t)
 				f.env["POSTGRES_DATABASE"], f.env["S3_PREFIX"], f.env["BACKUP_FILENAME_MODE"] = "app", tc.prefix, mode
 				f.env["BACKUP_KEEP_DAYS"] = "7"
-				oldKey := tc.timestamp + "app_2000-01-01T00:00:00.dump"
+				oldKey := tc.timestamp + "app/2000-01-01T00:00:00.dump"
 				f.s3.objects = []object{{Key: oldKey, LastModified: "2000-01-01T00:00:00Z"}}
 				f.run(true, "backup")
-				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.timestamp+"app_")
+				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.timestamp+"app/")
 				assertEqual(t, keys(f.s3.calls("DELETE")), []string{oldKey})
 				if mode == "fixed" {
-					key := tc.fixed + "app/latest.dump"
+					key := tc.fixed + "app.dump"
 					assertEqual(t, keys(f.s3.calls("PUT")), []string{key})
 					f.run(true, "restore")
 					assertEqual(t, keys(f.s3.calls("GET")), []string{key})
 				} else {
-					if !strings.HasPrefix(f.s3.calls("PUT")[0].Key, tc.timestamp+"app_") {
+					if !strings.HasPrefix(f.s3.calls("PUT")[0].Key, tc.timestamp+"app/") {
 						t.Fatalf("timestamp prefix changed: %v", keys(f.s3.calls("PUT")))
 					}
 					f.run(true, "restore", "2000-01-01T00:00:00")
@@ -711,11 +711,11 @@ func TestLatestRestoreExactMatchingAndPagination(t *testing.T) {
 	f.env["POSTGRES_DATABASE"] = "app"
 	f.s3.pageSize = 1000
 	for i := 0; i < 1001; i++ {
-		key := "backup/app_" + time.Date(2020, 1, 1, 0, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05") + ".dump"
+		key := "backup/app/" + time.Date(2020, 1, 1, 0, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05") + ".dump"
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2020-01-01T00:00:00Z"})
 	}
 	want := f.s3.objects[1000].Key
-	for _, key := range []string{"backup/app_extra_2030-01-01T00:00:00.dump", "backup/app_2025-01-01T00:00:00.dump.gpg", "backup/app_2040-01-01T00%3A00%3A00/latest.dump"} {
+	for _, key := range []string{"backup/app_extra/2030-01-01T00:00:00.dump", "backup/app_2030-01-01T00:00:00.dump", "backup/app/latest.dump", "backup/app/2025-01-01T00:00:00.dump.gpg", "backup/app/2040-01-01T00%3A00%3A00/latest.dump"} {
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2000-01-01T00:00:00Z"})
 	}
 	f.run(true, "restore")
@@ -785,7 +785,7 @@ func TestBackupLockCoversDumpUploadAndRetentionAcrossProcesses(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			first := newFixture(t)
 			first.env["POSTGRES_DATABASE"], first.env["BACKUP_KEEP_DAYS"] = "app", "7"
-			first.s3.objects = []object{{Key: "backup/app_2000-01-01T00:00:00.dump", LastModified: "2000-01-01T00:00:00Z"}}
+			first.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00.dump", LastModified: "2000-01-01T00:00:00Z"}}
 			entered, release := filepath.Join(first.dir, "entered"), filepath.Join(first.dir, "release")
 			if stage == "dump" {
 				first.env["FAKE_PAUSE_COMMAND"], first.env["FAKE_PAUSE_ENTERED"], first.env["FAKE_PAUSE_RELEASE"] = "pg_dump", entered, release
