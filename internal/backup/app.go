@@ -1,9 +1,7 @@
 package backup
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -93,10 +91,25 @@ func (a *App) Backup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// The shell implementation captured epoch seconds at run start. Preserve
-	// that boundary so objects at the cutoff second are still retained.
-	cutoff := a.now().UTC().Truncate(time.Second).Add(-time.Duration(days) * 24 * time.Hour)
+	started := a.now().Round(0)
+	partSize := a.Config.Storage.UploadPartSizeBytes
+	if partSize == 0 {
+		partSize = storage.DefaultUploadPartSizeBytes
+	}
+	maxBytes := partSize * storage.MaxUploadParts
+	fmt.Fprintf(a.Out, "S3 upload settings: part size %d MiB; multipart limit %d parts, %d bytes (%.3f GiB) per database backup after compression and any encryption.\n",
+		partSize/(1024*1024), storage.MaxUploadParts, maxBytes, float64(maxBytes)/(1024*1024*1024))
 	runner := a.runner(lock)
+	opts, err := parseDumpOptions(a.Config.DumpOptions, a.Config.AllowPartial)
+	if err != nil {
+		return err
+	}
+	if err := runner.checkDumpClient(ctx, opts.minClientMajor); err != nil {
+		return err
+	}
+	if opts.partial {
+		fmt.Fprintln(a.Err, "WARNING: partial database backup explicitly enabled; selected contents may omit data, definitions, or dependencies needed for restore.")
+	}
 	if a.Config.FilenameMode == "fixed" {
 		enabled, err := a.Store.VersioningEnabled(ctx)
 		if err != nil {
@@ -118,17 +131,32 @@ func (a *App) Backup(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := a.backupDatabase(ctx, runner, database); err != nil {
+		databaseStarted := a.now().Round(0)
+		if databaseStarted.Before(started) {
+			return errClockRollback
+		}
+		checkClock := func() error { return a.checkClock(databaseStarted) }
+		key, err := a.backupDatabase(ctx, runner, database, databaseStarted)
+		if err != nil {
 			fmt.Fprintf(a.Err, "Backup failed: %s: %v\n", database, err)
+			if errors.Is(err, errClockRollback) {
+				return err
+			}
 			failed++
 		} else {
 			succeeded++
 			if days > 0 {
-				if err := a.removeOldBackups(ctx, database, cutoff); err != nil {
+				if err := a.removeOldBackups(ctx, database, key, days, checkClock); err != nil {
 					fmt.Fprintf(a.Err, "Retention cleanup failed: %s: %v\n", database, err)
+					if errors.Is(err, errClockRollback) {
+						return err
+					}
 					cleanupFailed++
 				}
 			}
+		}
+		if err := checkClock(); err != nil {
+			return err
 		}
 	}
 	fmt.Fprintf(a.Out, "Backup summary: %d succeeded, %d failed, %d retention cleanups failed.\n", succeeded, failed, cleanupFailed)
@@ -151,13 +179,9 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 	if c.BackupAll == "true" {
 		fmt.Fprintln(a.Out, "Discovering databases...")
 		args := append([]string{"-X", "-A", "-t", "-v", "ON_ERROR_STOP=1"}, a.connectionArgs(c.MaintenanceDB)...)
-		args = append(args, "-c", "SELECT COALESCE(json_agg(datname ORDER BY datname), '[]'::json) FROM pg_database WHERE NOT datistemplate AND datallowconn;")
-		var output bytes.Buffer
-		if err := runner.run(ctx, &output, "psql", args...); err != nil {
+		args = append(args, "-c", "SELECT COALESCE(pg_catalog.json_agg(datname ORDER BY datname), '[]'::pg_catalog.json) FROM pg_catalog.pg_database WHERE NOT datistemplate AND datallowconn;")
+		if err := runner.queryJSON(ctx, &names, args...); err != nil {
 			return nil, fmt.Errorf("Could not discover databases: %w", err)
-		}
-		if err := json.Unmarshal(output.Bytes(), &names); err != nil {
-			return nil, fmt.Errorf("invalid database discovery result: %w", err)
 		}
 	} else if c.Databases != "" {
 		names = parseDatabaseList(c.Databases)
@@ -193,17 +217,36 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 	return selected, nil
 }
 
-func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database string) error {
-	key := a.Config.backupKey(database, a.now())
+var errClockRollback = errors.New("wall clock moved backwards; backup stopped")
+
+func (a *App) checkClock(started time.Time) error {
+	// Remove Go's monotonic component: this check is about wall-clock changes.
+	if ended := a.now().Round(0); ended.Before(started.Round(0)) {
+		return fmt.Errorf("%w: start=%s current=%s", errClockRollback, started.Format(time.RFC3339Nano), ended.Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database string, started time.Time) (string, error) {
+	key, err := a.Config.backupKey(database, started)
+	if err != nil {
+		return "", err
+	}
+	standby, err := a.checkBackupSource(ctx, runner, database)
+	if err != nil {
+		return "", err
+	}
 	fmt.Fprintf(a.Out, "Creating backup of %s database...\n", database)
-	args := append([]string{"--format=custom"}, a.connectionArgs(database)...)
-	// Preserve shell IFS splitting; quotes and wildcards remain literal data.
-	opts := strings.FieldsFunc(a.Config.DumpOptions, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' })
-	commands := []pipelineCommand{{name: "pg_dump", args: append(args, opts...)}}
+	args := append([]string{"--format=custom"}, a.dumpConnectionArgs(database, standby)...)
+	opts, err := parseDumpOptions(a.Config.DumpOptions, a.Config.AllowPartial)
+	if err != nil {
+		return "", err
+	}
+	commands := []pipelineCommand{{name: "pg_dump", args: append(args, opts.args...), customDump: true, rejectUnlogged: standby && !a.Config.AllowPartial}}
 	if a.Config.Passphrase != "" {
 		fmt.Fprintf(a.Out, "Encrypting backup of %s...\n", database)
-		commands = append(commands, pipelineCommand{name: "gpg", args: []string{
-			"--symmetric", "--batch", "--pinentry-mode", "loopback", "--passphrase", a.Config.Passphrase, "--output", "-",
+		commands = append(commands, pipelineCommand{name: "gpg", passphrase: a.Config.Passphrase, args: []string{
+			"--symmetric", "--batch", "--pinentry-mode", "loopback", "--output", "-",
 		}})
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -220,50 +263,67 @@ func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database
 		done <- err
 	}()
 	fmt.Fprintf(a.Out, "Uploading backup of %s...\n", database)
-	uploadErr := a.Store.Upload(ctx, key, reader)
+	uploadErr := a.Store.Upload(ctx, key, reader, storage.UploadOptions{
+		IfAbsent:      a.Config.FilenameMode != "fixed",
+		BeforePublish: func() error { return a.checkClock(started) },
+	})
 	// An upload failure must stop both pg_dump and GPG and release backpressure.
 	if uploadErr != nil {
 		cancel()
 		reader.CloseWithError(uploadErr)
 	}
 	if err := errors.Join(uploadErr, <-done); err != nil {
-		return err
+		return "", err
 	}
-	fmt.Fprintf(a.Out, "Backup complete: %s\n", database)
-	return nil
+	if err := a.checkClock(started); err != nil {
+		return "", err
+	}
+	fmt.Fprintf(a.Out, "Backup complete: %s; key: %s\n", database, key)
+	return key, nil
 }
 
-func (a *App) timestampBackups(ctx context.Context, database string) ([]storage.Object, error) {
-	objects, err := a.Store.List(ctx, a.Config.timestampPrefix(database))
+func (a *App) timestampBackups(ctx context.Context, database string) (storage.Listing, error) {
+	listing, err := a.Store.List(ctx, a.Config.timestampPrefix(database))
 	if err != nil {
-		return nil, err
+		return storage.Listing{}, err
 	}
 	var backups []storage.Object
-	for _, object := range objects {
+	for _, object := range listing.Objects {
 		if a.Config.isTimestampBackup(database, object.Key) {
 			backups = append(backups, object)
 		}
 	}
-	return backups, nil
+	listing.Objects = backups
+	return listing, nil
 }
 
-func (a *App) removeOldBackups(ctx context.Context, database string, cutoff time.Time) error {
-	objects, err := a.timestampBackups(ctx, database)
+func (a *App) removeOldBackups(ctx context.Context, database, publishedKey string, days int, checkClock func() error) error {
+	if err := checkClock(); err != nil {
+		return err
+	}
+	listing, err := a.timestampBackups(ctx, database)
 	if err != nil {
 		return err
 	}
-	for _, object := range objects {
+	if listing.ServerTime.IsZero() {
+		return fmt.Errorf("S3 listing has no valid server Date; backup retained, retention stopped")
+	}
+	cutoff := listing.ServerTime.UTC().Add(-time.Duration(days) * 24 * time.Hour)
+	for _, object := range listing.Objects {
 		// Missing timestamps must never turn an incomplete response into deletion.
 		if object.LastModified.IsZero() {
 			return fmt.Errorf("missing LastModified for %q", object.Key)
 		}
 	}
-	for _, object := range objects {
+	for _, object := range listing.Objects {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if object.LastModified.Before(cutoff) {
-			if err := a.Store.Delete(ctx, object.Key); err != nil {
+		if object.Key != publishedKey && object.LastModified.Before(cutoff) {
+			if err := checkClock(); err != nil {
+				return err
+			}
+			if err := a.Store.Delete(ctx, object.Key, checkClock); err != nil {
 				return err
 			}
 		}
@@ -272,6 +332,9 @@ func (a *App) removeOldBackups(ctx context.Context, database string, cutoff time
 }
 
 func (a *App) Restore(ctx context.Context, args []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c := a.Config
 	if c.Database == "" {
 		return fmt.Errorf("Set POSTGRES_DATABASE to the single database to restore.")
@@ -279,41 +342,51 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 	if err := validateDatabases([]string{c.Database}); err != nil {
 		return err
 	}
-	timestamp, versionID := "", ""
+	if err := validatePassphrase(c.Passphrase); err != nil {
+		return err
+	}
+	generation, versionID := "", ""
 	switch len(args) {
 	case 0:
 	case 1:
 		if c.FilenameMode != "timestamp" {
 			return fmt.Errorf("Use --version-id ID to restore a previous fixed-name backup.")
 		}
-		if !timestampPattern.MatchString(args[0]) {
-			return fmt.Errorf("Invalid backup timestamp.")
+		if !validGeneration(args[0]) {
+			return fmt.Errorf("Invalid backup generation; use the full timestamp-ID name without .dump or .dump.gpg.")
 		}
-		timestamp = args[0]
+		generation = args[0]
 	case 2:
 		if args[0] != "--version-id" || args[1] == "" || c.FilenameMode != "fixed" {
 			return fmt.Errorf("--version-id ID requires BACKUP_FILENAME_MODE=fixed.")
 		}
 		versionID = args[1]
 	default:
-		return fmt.Errorf("Usage: restore.sh [timestamp | --version-id ID]")
+		return fmt.Errorf("Usage: restore.sh [generation | --version-id ID]")
 	}
+	lock, err := acquireLock(a.lockPath)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	return withWorkspace(func(dir string) error {
 		var key string
 		switch {
 		case c.FilenameMode == "fixed":
 			key = c.fixedKey(c.Database)
-		case timestamp != "":
-			key = c.timestampPrefix(c.Database) + timestamp + c.fileType()
+		case generation != "":
+			key = c.timestampPrefix(c.Database) + generation + c.fileType()
 		default:
 			fmt.Fprintf(a.Out, "Finding latest backup of %s...\n", c.Database)
 			objects, err := a.timestampBackups(ctx, c.Database)
 			if err != nil {
 				return fmt.Errorf("Could not list backups: %w", err)
 			}
-			for _, object := range objects {
-				if strings.HasSuffix(object.Key, c.fileType()) && object.Key > key {
+			var latest time.Time
+			for _, object := range objects.Objects {
+				if strings.HasSuffix(object.Key, c.fileType()) && (key == "" || object.LastModified.After(latest) || (object.LastModified.Equal(latest) && object.Key > key)) {
 					key = object.Key
+					latest = object.LastModified
 				}
 			}
 			if key == "" {
@@ -324,22 +397,38 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 		if err := a.Store.Download(ctx, key, versionID, filepath.Join(dir, "db"+c.fileType())); err != nil {
 			return err
 		}
-		runner := a.runner(nil)
+		runner := a.runner(lock)
 		if c.Passphrase != "" {
 			fmt.Fprintln(a.Out, "Decrypting backup...")
 			file, err := os.OpenFile(filepath.Join(dir, "db.dump"), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 			if err != nil {
 				return err
 			}
-			err = runner.run(ctx, file, "gpg", "--decrypt", "--batch", "--pinentry-mode", "loopback", "--passphrase", c.Passphrase, filepath.Join(dir, "db.dump.gpg"))
+			err = runner.pipeline(ctx, file, pipelineCommand{name: "gpg", passphrase: c.Passphrase, args: []string{
+				"--decrypt", "--batch", "--pinentry-mode", "loopback", filepath.Join(dir, "db.dump.gpg"),
+			}})
 			err = errors.Join(err, file.Close())
 			if err != nil {
 				return err
 			}
 		}
+		path := filepath.Join(dir, "db.dump")
+		if err := validateRestoreArchive(ctx, path); err != nil {
+			return err
+		}
 		fmt.Fprintf(a.Out, "Restoring %s from backup...\n", c.Database)
-		args := append(a.connectionArgs(c.Database), "--exit-on-error", "--clean", "--if-exists", filepath.Join(dir, "db.dump"))
-		if err := runner.run(ctx, a.Out, "pg_restore", args...); err != nil {
+		args := append(a.connectionArgs(c.Database), "--single-transaction", "--exit-on-error", "--clean", "--if-exists")
+		if c.RestoreNoOwner {
+			args = append(args, "--no-owner")
+		}
+		if c.RestoreNoTablespaces {
+			args = append(args, "--no-tablespaces")
+		}
+		if c.RestoreNoTableAccessMethod {
+			args = append(args, "--no-table-access-method")
+		}
+		args = append(args, path)
+		if err := runner.restore(ctx, args...); err != nil {
 			return err
 		}
 		fmt.Fprintln(a.Out, "Restore complete.")

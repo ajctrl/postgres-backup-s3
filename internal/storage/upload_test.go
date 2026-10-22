@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -28,6 +29,131 @@ func (r failingStream) Read(p []byte) (int, error) {
 		err = r.err
 	}
 	return n, err
+}
+
+func TestUploadLimitReader(t *testing.T) {
+	limitErr := errors.New("upload limit exceeded")
+	sourceErr := errors.New("producer failed at the limit")
+	for _, tc := range []struct {
+		name   string
+		source func() io.Reader
+		want   string
+		err    error
+	}{
+		{"short", func() io.Reader { return strings.NewReader("abc") }, "abc", nil},
+		{"exact", func() io.Reader { return strings.NewReader("abcd") }, "abcd", nil},
+		{"exact with EOF", func() io.Reader { return iotest.DataErrReader(strings.NewReader("abcd")) }, "abcd", nil},
+		{"over", func() io.Reader { return strings.NewReader("abcde") }, "abcd", limitErr},
+		{"over with EOF", func() io.Reader { return iotest.DataErrReader(strings.NewReader("abcde")) }, "abcd", limitErr},
+		{"late failure", func() io.Reader { return failingStream{strings.NewReader("abcd"), sourceErr} }, "abcd", sourceErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, bufferSize := range []int{1, 3, 8} {
+				r := &uploadLimitReader{reader: tc.source(), remaining: 4, limitErr: limitErr}
+				var got bytes.Buffer
+				buf := make([]byte, bufferSize)
+				var err error
+				for err == nil {
+					var n int
+					n, err = r.Read(buf)
+					got.Write(buf[:n])
+				}
+				if err == io.EOF {
+					err = nil
+				}
+				if got.String() != tc.want || !errors.Is(err, tc.err) {
+					t.Fatalf("buffer=%d: data=%q err=%v, want data=%q err=%v", bufferSize, got.String(), err, tc.want, tc.err)
+				}
+				if n, err := r.Read(nil); n != 0 || err != nil {
+					t.Fatalf("zero-length read: %d, %v", n, err)
+				}
+			}
+		})
+	}
+}
+
+type trackedUploadBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *trackedUploadBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestStreamingUploadLimitBoundary(t *testing.T) {
+	// Reduce only the part count, exercising the real SDK and S3 abort/complete
+	// requests at the same boundary without generating an 80 GiB stream.
+	const partSize = 5 * 1024 * 1024
+	const maxParts = 2
+	const limit = partSize * maxParts
+	sourceErr := errors.New("pg_dump failed at the limit")
+	for _, tc := range []struct {
+		name      string
+		size      int
+		sourceErr error
+	}{
+		{"below", limit - 1, nil},
+		{"exact", limit, nil},
+		{"over", limit + 1, nil},
+		{"late producer failure", limit, sourceErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var initiated, aborted, completed atomic.Bool
+			var uploaded atomic.Int64
+			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+					initiated.Store(true)
+					writeXML(w, `<InitiateMultipartUploadResult><UploadId>boundary</UploadId></InitiateMultipartUploadResult>`)
+				case r.Method == http.MethodPut && r.URL.Query().Has("partNumber"):
+					if part := r.URL.Query().Get("partNumber"); part != "1" && part != "2" {
+						t.Errorf("unexpected part number %s", part)
+					}
+					n, err := io.Copy(io.Discard, r.Body)
+					if err != nil {
+						t.Error(err)
+					}
+					uploaded.Add(n)
+					w.Header().Set("ETag", `"part"`)
+				case r.Method == http.MethodPost && r.URL.Query().Has("uploadId"):
+					completed.Store(true)
+					writeXML(w, `<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`)
+				case r.Method == http.MethodDelete && r.URL.Query().Has("uploadId"):
+					aborted.Store(true)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					writeS3Error(w, http.StatusBadRequest, "UnexpectedRequest")
+				}
+			})
+			s.uploadPartSize = partSize
+			var source io.Reader = bytes.NewReader(make([]byte, tc.size))
+			if tc.sourceErr != nil {
+				source = failingStream{source, tc.sourceErr}
+			}
+			body := &trackedUploadBody{Reader: source}
+			err := s.upload(t.Context(), "latest.dump", body, maxParts, UploadOptions{})
+			wantSuccess := tc.size <= limit && tc.sourceErr == nil
+			if (err == nil) != wantSuccess || !initiated.Load() || completed.Load() != wantSuccess || aborted.Load() == wantSuccess || !body.closed {
+				t.Fatalf("err=%v initiated=%v completed=%v aborted=%v closed=%v", err, initiated.Load(), completed.Load(), aborted.Load(), body.closed)
+			}
+			if wantSuccess && uploaded.Load() != int64(tc.size) {
+				t.Fatalf("uploaded %d bytes, want %d", uploaded.Load(), tc.size)
+			}
+			if tc.sourceErr != nil && !errors.Is(err, tc.sourceErr) {
+				t.Fatalf("producer error lost: %v", err)
+			}
+			if tc.size > limit {
+				for _, want := range []string{"10485760 bytes", "2 parts at 5 MiB", "increase S3_UPLOAD_PART_SIZE_MB", "retry the backup"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err, want)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestStreamingUploadRejectsProducerFailure(t *testing.T) {
@@ -52,7 +178,7 @@ func TestStreamingUploadRejectsProducerFailure(t *testing.T) {
 			})
 			sourceErr := errors.New("pg_dump failed after emitting data")
 			body := io.NopCloser(failingStream{Reader: bytes.NewReader(make([]byte, size)), err: sourceErr})
-			if err := s.Upload(t.Context(), "latest.dump", body); !errors.Is(err, sourceErr) {
+			if err := s.Upload(t.Context(), "latest.dump", body, UploadOptions{}); !errors.Is(err, sourceErr) {
 				t.Fatalf("producer failure was lost: %v", err)
 			}
 			if published.Load() || initiated.Load() != aborted.Load() || initiated.Load() != (size > 8*1024*1024) {
@@ -88,7 +214,7 @@ func TestStreamingUploadPartFailureInterruptsBlockedProducer(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	err := s.Upload(ctx, "latest.dump", reader)
+	err := s.Upload(ctx, "latest.dump", reader, UploadOptions{})
 	<-written
 	if err == nil || !strings.Contains(err.Error(), "AccessDenied") || ctx.Err() != nil || !aborted.Load() {
 		t.Fatalf("err=%v outer context=%v aborted=%v", err, ctx.Err(), aborted.Load())
@@ -101,7 +227,7 @@ func TestStreamingUploadCancellationInterruptsInitialRead(t *testing.T) {
 	defer writer.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- s.Upload(ctx, "key", reader) }()
+	go func() { done <- s.Upload(ctx, "key", reader, UploadOptions{}) }()
 	if _, err := writer.Write([]byte("partial")); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +286,7 @@ func TestStreamingUploadRetriesBufferedPart(t *testing.T) {
 	})
 	// NopCloser hides Seek: retries must use the SDK's bounded part buffer.
 	body := io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("data"), 3*1024*1024)))
-	if err := s.Upload(t.Context(), "key", body); err != nil {
+	if err := s.Upload(t.Context(), "key", body, UploadOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()

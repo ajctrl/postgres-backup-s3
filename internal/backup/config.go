@@ -3,7 +3,6 @@ package backup
 import (
 	"fmt"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,15 +11,13 @@ import (
 	"github.com/bartels/postgres-backup-s3/internal/storage"
 )
 
-const timestampLayout = "2006-01-02T15:04:05"
-
-var timestampPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$`)
-var backupSuffixPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.dump(\.gpg)?$`)
-
 type Config struct {
 	Database, Databases, BackupAll, Exclude, MaintenanceDB string
 	Host, Port, User, Password, DumpOptions                string
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule   string
+	RestoreNoOwner                                         bool
+	RestoreNoTablespaces, RestoreNoTableAccessMethod       bool
+	AllowPartial                                           bool
 	Storage                                                storage.Config
 }
 
@@ -75,10 +72,36 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 		return c, fmt.Errorf("S3_UPLOAD_PART_SIZE_MB must be an integer between 5 and 5120 (MiB).")
 	}
 	c.Storage.UploadPartSizeBytes = partSize * 1024 * 1024
+	for _, setting := range []struct {
+		name string
+		dest *bool
+	}{
+		{"RESTORE_NO_OWNER", &c.RestoreNoOwner},
+		{"RESTORE_NO_TABLESPACES", &c.RestoreNoTablespaces},
+		{"RESTORE_NO_TABLE_ACCESS_METHOD", &c.RestoreNoTableAccessMethod},
+		{"BACKUP_ALLOW_PARTIAL", &c.AllowPartial},
+	} {
+		switch valueOr(setting.name, "false") {
+		case "true":
+			*setting.dest = true
+		case "false":
+		default:
+			return c, fmt.Errorf("%s must be true or false.", setting.name)
+		}
+	}
+	if err := validatePassphrase(c.Passphrase); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
 func (c Config) validateBackup() (int, error) {
+	if err := validatePassphrase(c.Passphrase); err != nil {
+		return 0, err
+	}
+	if _, err := parseDumpOptions(c.DumpOptions, c.AllowPartial); err != nil {
+		return 0, err
+	}
 	switch c.BackupAll {
 	case "true":
 		if c.Database != "" || c.Databases != "" {
@@ -174,14 +197,22 @@ func databaseKeyComponent(database string) string {
 	return component
 }
 
-func (c Config) backupKey(database string, now time.Time) string {
+func (c Config) backupKey(database string, now time.Time) (string, error) {
 	if c.FilenameMode == "fixed" {
-		return c.fixedKey(database)
+		return c.fixedKey(database), nil
 	}
-	return c.timestampPrefix(database) + now.UTC().Format(timestampLayout) + c.fileType()
+	generation, err := newGeneration(now)
+	if err != nil {
+		return "", err
+	}
+	return c.timestampPrefix(database) + generation + c.fileType(), nil
 }
 
 func (c Config) isTimestampBackup(database, key string) bool {
 	prefix := c.timestampPrefix(database)
-	return strings.HasPrefix(key, prefix) && backupSuffixPattern.MatchString(strings.TrimPrefix(key, prefix))
+	if !strings.HasPrefix(key, prefix) {
+		return false
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(key, prefix), ".gpg")
+	return strings.HasSuffix(name, ".dump") && validGeneration(strings.TrimSuffix(name, ".dump"))
 }

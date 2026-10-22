@@ -3,7 +3,9 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // Pin the distroless multi-platform image from the official Silo release.
@@ -102,7 +105,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		"S3_ACCESS_KEY_ID": "integration", "S3_SECRET_ACCESS_KEY": "integration-password",
 	}
 	runNumber := 0
-	runBackupImage := func(t *testing.T, overrides map[string]string, command ...string) {
+	runImage := func(t *testing.T, overrides map[string]string, command ...string) (string, error) {
 		t.Helper()
 		runNumber++
 		container := fmt.Sprintf("%s-run-%d", name, runNumber)
@@ -125,7 +128,16 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 		args = append(args, image)
 		args = append(args, command...)
-		t.Log(strings.TrimSpace(docker(t, ctx, args...)))
+		out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	runBackupImage := func(t *testing.T, overrides map[string]string, command ...string) {
+		t.Helper()
+		out, err := runImage(t, overrides, command...)
+		if err != nil {
+			t.Fatalf("backup image failed: %v\n%s", err, out)
+		}
+		t.Log(out)
 	}
 
 	if !t.Run("timestamp_plaintext", func(t *testing.T) {
@@ -141,6 +153,14 @@ func TestDockerBackupRestore(t *testing.T) {
 		if len(objects.Contents) != 1 || !strings.HasSuffix(aws.ToString(objects.Contents[0].Key), ".dump") {
 			t.Fatalf("expected one timestamped dump, got %+v", objects.Contents)
 		}
+		_, collisionErr := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: objects.Contents[0].Key,
+			Body: strings.NewReader("must not replace the backup"), IfNoneMatch: aws.String("*"),
+		})
+		var apiErr smithy.APIError
+		if !errors.As(collisionErr, &apiErr) || apiErr.ErrorCode() != "PreconditionFailed" {
+			t.Fatalf("provider did not reject generation overwrite: %v", collisionErr)
+		}
 		object, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: objects.Contents[0].Key})
 		if err != nil {
 			t.Fatal(err)
@@ -152,11 +172,133 @@ func TestDockerBackupRestore(t *testing.T) {
 			t.Fatalf("backup is not a PostgreSQL custom-format dump: header %q, error %v", header, readErr)
 		}
 		sql(t, "UPDATE backup_probe SET value = 'changed after backup'")
-		runBackupImage(t, env, "sh", "restore.sh")
+		generation := strings.TrimSuffix(strings.TrimPrefix(aws.ToString(objects.Contents[0].Key), "timestamp/app/"), ".dump")
+		runBackupImage(t, env, "sh", "restore.sh", generation)
 		assertValue(t, "original")
 	}) {
 		return
 	}
+	t.Run("partial_backup_permission", func(t *testing.T) {
+		env := map[string]string{"S3_PREFIX": "partial", "PGDUMP_EXTRA_OPTS": "--table=backup_probe"}
+		output, err := runImage(t, env, "postgres-backup-s3", "backup")
+		if err == nil || !strings.Contains(output, "BACKUP_ALLOW_PARTIAL=true") {
+			t.Fatalf("partial backup did not require explicit permission: %v\n%s", err, output)
+		}
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("partial/")})
+		if err != nil || len(objects.Contents) != 0 {
+			t.Fatalf("rejected partial backup published data: %v, %+v", err, objects)
+		}
+		env["BACKUP_ALLOW_PARTIAL"] = "true"
+		runBackupImage(t, env, "postgres-backup-s3", "backup")
+		objects, err = client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("partial/")})
+		if err != nil || len(objects.Contents) != 1 {
+			t.Fatalf("authorized partial backup not published: %v, %+v", err, objects)
+		}
+	})
+	t.Run("client_version_specific_option", func(t *testing.T) {
+		env := map[string]string{"S3_PREFIX": "client-version", "PGDUMP_EXTRA_OPTS": "--no-statistics"}
+		version, err := runImage(t, nil, "pg_dump", "--version")
+		if err != nil {
+			t.Fatalf("read backup-image client version: %v\n%s", err, version)
+		}
+		output, err := runImage(t, env, "postgres-backup-s3", "backup")
+		wantObjects := 1
+		if strings.Contains(version, " 17.") {
+			wantObjects = 0
+			if err == nil || !strings.Contains(output, "requires pg_dump 18") {
+				t.Fatalf("PostgreSQL 17 did not reject version-specific option: %v\n%s", err, output)
+			}
+		} else if err != nil {
+			t.Fatalf("supported client rejected option: %v\n%s", err, output)
+		}
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("client-version/")})
+		if err != nil || len(objects.Contents) != wantObjects {
+			t.Fatalf("unexpected publication after client check: %v, %+v", err, objects)
+		}
+	})
+	t.Run("failed_restore_rolls_back", func(t *testing.T) {
+		sql(t, "CREATE ROLE rollback_owner; CREATE TABLE rollback_probe (value text); ALTER TABLE rollback_probe OWNER TO rollback_owner; INSERT INTO rollback_probe VALUES ('backup');")
+		env := map[string]string{"S3_PREFIX": "rollback", "BACKUP_FILENAME_MODE": "fixed"}
+		runBackupImage(t, env, "postgres-backup-s3", "backup")
+		sql(t, "ALTER TABLE rollback_probe OWNER TO integration; DROP ROLE rollback_owner; UPDATE rollback_probe SET value = 'before failed restore'; UPDATE backup_probe SET value = 'before failed restore';")
+		output, err := runImage(t, env, "postgres-backup-s3", "restore")
+		if err == nil || !strings.Contains(output, "pg_restore failed") || strings.Contains(output, "rollback_owner") || strings.Contains(output, "Restore complete") {
+			t.Fatalf("expected missing-role restore failure: %v\n%s", err, output)
+		}
+		assertValue(t, "before failed restore")
+		if value := sql(t, "SELECT value FROM rollback_probe"); value != "before failed restore" {
+			t.Fatalf("failed restore changed existing data: %q", value)
+		}
+		env["RESTORE_NO_OWNER"] = "true"
+		runBackupImage(t, env, "postgres-backup-s3", "restore")
+		if value := sql(t, "SELECT value FROM rollback_probe"); value != "backup" {
+			t.Fatalf("restore without original owner did not restore data: %q", value)
+		}
+		if owner := sql(t, "SELECT tableowner FROM pg_tables WHERE schemaname='public' AND tablename='rollback_probe'"); owner != "integration" {
+			t.Fatalf("restored table owner = %q, want integration", owner)
+		}
+		sql(t, "DROP TABLE rollback_probe; UPDATE backup_probe SET value = 'original';")
+	})
+	t.Run("data_only_restore_rejected_before_sequence_changes", func(t *testing.T) {
+		sql(t, "CREATE SEQUENCE a_rollback_seq; CREATE SEQUENCE z_rollback_seq; SELECT setval('a_rollback_seq', 100);")
+		defer sql(t, "DROP SEQUENCE IF EXISTS a_rollback_seq, z_rollback_seq;")
+		body, err := exec.CommandContext(ctx, "docker", "exec", postgres, "pg_dump", "-U", "integration", "-d", "app", "--format=custom", "--data-only").Output()
+		if err != nil {
+			t.Fatalf("create historical data-only archive: %v", err)
+		}
+		_, err = client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("data-only/app.dump"), Body: bytes.NewReader(body)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sql(t, "SELECT setval('a_rollback_seq', 999); DROP SEQUENCE z_rollback_seq;")
+		output, err := runImage(t, map[string]string{"S3_PREFIX": "data-only", "BACKUP_FILENAME_MODE": "fixed"}, "postgres-backup-s3", "restore")
+		if err == nil || !strings.Contains(output, "before database access") || strings.Contains(output, "Restore complete") {
+			t.Fatalf("expected archive rejection: %v\n%s", err, output)
+		}
+		if value := sql(t, "SELECT last_value FROM a_rollback_seq"); value != "999" {
+			t.Fatalf("rejected restore changed existing sequence: %q", value)
+		}
+	})
+	t.Run("large_object_only_archives_rejected", func(t *testing.T) {
+		sql(t, "CREATE DATABASE lob_only")
+		defer sql(t, "DROP DATABASE lob_only")
+		lobSQL := func(query string) string {
+			return strings.TrimSpace(docker(t, ctx, "exec", postgres, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "integration", "-d", "lob_only", "-Atc", query))
+		}
+		lobSQL("SELECT lo_from_bytea(90000, convert_to('saved', 'UTF8'))")
+		var archives [][]byte
+		for _, extra := range [][]string{nil, {"--data-only"}} {
+			args := []string{"exec", postgres, "pg_dump", "-U", "integration", "-d", "lob_only", "--format=custom"}
+			body, err := exec.CommandContext(ctx, "docker", append(args, extra...)...).Output()
+			if err != nil {
+				t.Fatalf("create LO-only archive: %v", err)
+			}
+			archives = append(archives, body)
+		}
+		lobSQL("SELECT lo_put(90000, 0, convert_to('newer', 'UTF8'))")
+		env := map[string]string{"S3_PREFIX": "lo-only", "POSTGRES_DATABASE": "lob_only", "BACKUP_FILENAME_MODE": "fixed"}
+		for _, body := range archives {
+			if _, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("lo-only/lob_only.dump"), Body: bytes.NewReader(body)}); err != nil {
+				t.Fatal(err)
+			}
+			output, err := runImage(t, env, "postgres-backup-s3", "restore")
+			if err == nil || !strings.Contains(output, "before database access") {
+				t.Fatalf("LO-only restore was not rejected: %v\n%s", err, output)
+			}
+			if got := lobSQL("SELECT convert_from(lo_get(90000), 'UTF8')"); got != "newer" {
+				t.Fatalf("rejected restore changed large-object contents: %q", got)
+			}
+		}
+		env["S3_PREFIX"], env["BACKUP_KEEP_DAYS"] = "lo-new", "7"
+		output, err := runImage(t, env, "postgres-backup-s3", "backup")
+		if err == nil || !strings.Contains(output, "ambiguous archive") {
+			t.Fatalf("ambiguous new backup did not fail: %v\n%s", err, output)
+		}
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("lo-new/")})
+		if err != nil || len(objects.Contents) != 0 {
+			t.Fatalf("ambiguous backup was published: %v, %+v", err, objects)
+		}
+	})
 	t.Run("fixed_encrypted_versions", func(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "fixed/", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
 		key := "fixed/app.dump.gpg"
@@ -193,12 +335,16 @@ func TestDockerBackupRestore(t *testing.T) {
 		sql(t, "CREATE TABLE stream_probe AS SELECT g AS id, md5(g::text) || md5((g + 1000000)::text) AS value FROM generate_series(1, 400000) AS g;")
 		want := sql(t, "SELECT count(*) || ':' || md5(string_agg(value, '' ORDER BY id)) FROM stream_probe")
 		env := map[string]string{
-			"S3_PREFIX": "streaming", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "streaming passphrase",
+			"S3_PREFIX": "streaming", "BACKUP_FILENAME_MODE": "timestamp", "PASSPHRASE": "streaming passphrase",
 			"S3_UPLOAD_PART_SIZE_MB": "5", "PGDUMP_EXTRA_OPTS": "--compress=0", "TMPDIR": "/proc",
 		}
 		// /proc cannot hold temporary dump files. Only streaming can succeed here.
 		runBackupImage(t, env, "postgres-backup-s3", "backup")
-		object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("streaming/app.dump.gpg")})
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("streaming/app/")})
+		if err != nil || len(objects.Contents) != 1 {
+			t.Fatalf("expected one multipart generation: %v, %v", objects, err)
+		}
+		object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: objects.Contents[0].Key})
 		if err != nil {
 			t.Fatal(err)
 		}

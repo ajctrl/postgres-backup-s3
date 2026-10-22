@@ -82,12 +82,17 @@ func TestNamesAndKeys(t *testing.T) {
 				if passphrase != "" {
 					suffix += ".gpg"
 				}
-				if got := c.backupKey(name, date); got != tc.timestampPrefix+component+"/2026-09-12T10:30:00"+suffix {
-					t.Errorf("timestamp key %q/%q: %q", tc.prefix, name, got)
+				got, err := c.backupKey(name, date)
+				if err != nil || !strings.HasPrefix(got, tc.timestampPrefix+component+"/2026-09-12T10:30:00-") || !strings.HasSuffix(got, suffix) || !c.isTimestampBackup(name, got) {
+					t.Errorf("generation key %q/%q: %q, %v", tc.prefix, name, got, err)
+				}
+				second, err := c.backupKey(name, date)
+				if err != nil || second == got {
+					t.Fatalf("same timestamp reused a generation: %q, %v", second, err)
 				}
 				c.FilenameMode = "fixed"
-				if got := c.backupKey(name, date); got != tc.fixedPrefix+component+suffix {
-					t.Errorf("fixed key %q/%q: %q", tc.prefix, name, got)
+				if got, err := c.backupKey(name, date); err != nil || got != tc.fixedPrefix+component+suffix {
+					t.Errorf("fixed key %q/%q: %q, %v", tc.prefix, name, got, err)
 				}
 			}
 		}
@@ -126,5 +131,58 @@ func TestUploadPartSizeConfiguration(t *testing.T) {
 				t.Fatalf("part size was not converted to bytes: %d", c.Storage.UploadPartSizeBytes)
 			}
 		})
+	}
+}
+
+func TestRestoreOptionConfiguration(t *testing.T) {
+	for _, name := range []string{"RESTORE_NO_OWNER", "RESTORE_NO_TABLESPACES", "RESTORE_NO_TABLE_ACCESS_METHOD"} {
+		for _, value := range []string{"", "false", "true", "TRUE", "1", "no", " true"} {
+			t.Run(name+"="+value, func(t *testing.T) {
+				env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db", name: value}
+				c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+				valid := value == "" || value == "false" || value == "true"
+				if (err == nil) != valid || !valid && !strings.Contains(err.Error(), name) {
+					t.Fatalf("%s=%q: error=%v", name, value, err)
+				}
+				if valid {
+					for setting, enabled := range map[string]bool{
+						"RESTORE_NO_OWNER":               c.RestoreNoOwner,
+						"RESTORE_NO_TABLESPACES":         c.RestoreNoTablespaces,
+						"RESTORE_NO_TABLE_ACCESS_METHOD": c.RestoreNoTableAccessMethod,
+					} {
+						if enabled != (setting == name && value == "true") {
+							t.Errorf("%s=%q unexpectedly set %s to %v", name, value, setting, enabled)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPartialBackupConfigurationAndDatabaseSelection(t *testing.T) {
+	for _, value := range []string{"", "false", "true", "TRUE", "1", "no"} {
+		env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db", "BACKUP_ALLOW_PARTIAL": value}
+		c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+		valid := value == "" || value == "false" || value == "true"
+		if (err == nil) != valid || valid && c.AllowPartial != (value == "true") {
+			t.Fatalf("BACKUP_ALLOW_PARTIAL=%q: %#v, %v", value, c, err)
+		}
+	}
+	for _, c := range []Config{
+		{Database: "app", BackupAll: "false"}, {Databases: "app,billing", BackupAll: "false"},
+		{BackupAll: "true", Exclude: "scratch"},
+	} {
+		if _, err := c.validateBackup(); err != nil {
+			t.Errorf("database selection incorrectly requires partial permission: %v", err)
+		}
+		c.DumpOptions = "--table=orders"
+		if _, err := c.validateBackup(); err == nil {
+			t.Fatal("table selection accepted without partial permission")
+		}
+		c.AllowPartial = true
+		if _, err := c.validateBackup(); err != nil {
+			t.Errorf("explicit partial permission rejected: %v", err)
+		}
 	}
 }

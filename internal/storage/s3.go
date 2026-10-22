@@ -5,18 +5,21 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	transfertypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 type Object struct {
@@ -24,12 +27,19 @@ type Object struct {
 	LastModified time.Time
 }
 
+type Listing struct {
+	Objects []Object
+	// ServerTime is the first page's HTTP Date, never the local wall clock.
+	// A missing/invalid Date leaves it zero: restore can list, retention must stop.
+	ServerTime time.Time
+}
+
 type Store interface {
 	VersioningEnabled(context.Context) (bool, error)
-	Upload(ctx context.Context, key string, body io.ReadCloser) error
+	Upload(ctx context.Context, key string, body io.ReadCloser, options UploadOptions) error
 	Download(ctx context.Context, key, versionID, path string) error
-	List(ctx context.Context, prefix string) ([]Object, error)
-	Delete(ctx context.Context, key string) error
+	List(ctx context.Context, prefix string) (Listing, error)
+	Delete(ctx context.Context, key string, beforeDelete func() error) error
 }
 
 type Config struct {
@@ -66,7 +76,7 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 		return nil, fmt.Errorf("S3 bucket must not be empty")
 	}
 	if cfg.UploadPartSizeBytes == 0 {
-		cfg.UploadPartSizeBytes = 8 * 1024 * 1024
+		cfg.UploadPartSizeBytes = DefaultUploadPartSizeBytes
 	}
 	if cfg.UploadPartSizeBytes < 5*1024*1024 || cfg.UploadPartSizeBytes > 5*1024*1024*1024 {
 		return nil, fmt.Errorf("S3 upload part size must be between 5 MiB and 5 GiB")
@@ -160,39 +170,46 @@ func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 	return nil
 }
 
-func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
+func (s *S3) List(ctx context.Context, prefix string) (Listing, error) {
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
 	})
-	var objects []Object
+	var listing Listing
+	firstPage := true
 	tokens := make(map[string]bool)
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list S3 objects: %w", err)
+			return Listing{}, fmt.Errorf("list S3 objects: %w", err)
+		}
+		if firstPage {
+			if response, ok := awsmiddleware.GetRawResponse(page.ResultMetadata).(*smithyhttp.Response); ok && response != nil && response.Response != nil {
+				listing.ServerTime, _ = http.ParseTime(response.Header.Get("Date"))
+			}
+			firstPage = false
 		}
 		for _, object := range page.Contents {
 			// Missing dates must not turn an unknown age into an expired backup.
 			if object.Key == nil || object.LastModified == nil {
-				return nil, fmt.Errorf("S3 list response contains an object without a key or modification time")
+				return Listing{}, fmt.Errorf("S3 list response contains an object without a key or modification time")
 			}
-			objects = append(objects, Object{Key: *object.Key, LastModified: *object.LastModified})
+			listing.Objects = append(listing.Objects, Object{Key: *object.Key, LastModified: *object.LastModified})
 		}
 		if aws.ToBool(page.IsTruncated) {
 			token := aws.ToString(page.NextContinuationToken)
 			if token == "" || tokens[token] {
-				return nil, fmt.Errorf("S3 list response contains an invalid continuation token")
+				return Listing{}, fmt.Errorf("S3 list response contains an invalid continuation token")
 			}
 			tokens[token] = true
 		}
 	}
-	return objects, nil
+	return listing, nil
 }
 
-func (s *S3) Delete(ctx context.Context, key string) error {
+func (s *S3) Delete(ctx context.Context, key string, beforeDelete func() error) error {
 	// Deliberately delete the current key only. Noncurrent versions remain
 	// governed by the bucket lifecycle, matching the previous aws s3 rm command.
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)}, withAttemptGuard(beforeDelete))
 	if err != nil {
 		return fmt.Errorf("delete S3 object %q: %w", key, err)
 	}

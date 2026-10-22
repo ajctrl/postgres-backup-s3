@@ -22,6 +22,7 @@ func streamingFixture(t *testing.T, encrypted bool) *fixture {
 	scripts := map[string]string{
 		"pg_dump": `#!/bin/sh
 set -eu
+cat "$FAKE_DUMP_FILE"
 dd if=/dev/zero bs=1048576 count=6 2>/dev/null
 exec 1>&-
 touch "$STREAM_ENTERED"
@@ -30,6 +31,12 @@ exit "${STREAM_EXIT:-0}"
 `,
 		"gpg": `#!/bin/sh
 set -eu
+[ "$1" = --passphrase-fd ]
+case "$2" in
+  3) IFS= read -r secret <&3;;
+  4) IFS= read -r secret <&4;;
+  *) exit 1;;
+esac
 cat
 touch "$STREAM_GPG_DONE"
 exit "${STREAM_GPG_EXIT:-0}"

@@ -51,6 +51,20 @@ jobs:
           POSTGRES_TEST_IMAGE: postgres:${{ matrix.postgres }}
         run: go test -count=1 -tags=integration -v -timeout=15m ./tests/integration
 
+      - name: Require native PostgreSQL regression tests
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: |
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/pgs3-native.test" ./internal/backup
+          chmod 755 "$RUNNER_TEMP/pgs3-native.test"
+          docker run --rm --user postgres \
+            -e PG_TEST_REQUIRED=true \
+            -e PG_TEST_BINDIR="/usr/lib/postgresql/$PG_MAJOR/bin" \
+            -v "$RUNNER_TEMP/pgs3-native.test:/tmp/pgs3-native.test:ro" \
+            "postgres:$PG_MAJOR" \
+            /tmp/pgs3-native.test -test.v -test.timeout=3m \
+            -test.run 'Test(ArchiveSchema|RestorePlacement)WithPostgreSQL'
+
   build-and-push-image:
     runs-on: ubuntu-latest
     needs: [test, integration]

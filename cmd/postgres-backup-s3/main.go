@@ -21,11 +21,11 @@ func run() int {
 		command, args = args[0], args[1:]
 	}
 	if command == "--help" || command == "-h" || command == "help" {
-		fmt.Println("Usage: postgres-backup-s3 [run | backup | restore [timestamp | --version-id ID]]")
+		fmt.Println("Usage: postgres-backup-s3 [run | backup | restore [generation | --version-id ID]]")
 		return 0
 	}
 	if command != "run" && command != "backup" && command != "restore" || command != "restore" && len(args) != 0 {
-		fmt.Fprintln(os.Stderr, "Usage: postgres-backup-s3 [run | backup | restore [timestamp | --version-id ID]]")
+		fmt.Fprintln(os.Stderr, "Usage: postgres-backup-s3 [run | backup | restore [generation | --version-id ID]]")
 		return 2
 	}
 	ctx, cancel := context.WithCancel(context.Background())
