@@ -20,7 +20,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-const defaultS3TestImage = "quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+// Pin the distroless multi-platform image from the official Silo release.
+// https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z
+const defaultS3TestImage = "docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless@sha256:472f59c7be537571f0f9a2ee6b8fe033a220939d521255bd4bf5339e53db7218"
 
 // TestDockerBackupRestore requires a local Docker daemon and an already-built
 // backup image. All credentials, containers and stored data belong to this test.
@@ -38,17 +40,19 @@ func TestDockerBackupRestore(t *testing.T) {
 	docker(t, ctx, "network", "create", name)
 	t.Cleanup(func() { dockerCleanup(t, "network", "rm", name) })
 	postgres := name + "-postgres"
-	minio := name + "-s3"
-	for _, container := range []string{postgres, minio} {
+	silo := name + "-s3"
+	for _, container := range []string{postgres, silo} {
 		t.Cleanup(func() { dockerCleanup(t, "rm", "-f", "-v", container) })
 	}
 	docker(t, ctx, "run", "-d", "--name", postgres, "--network", name, "--network-alias", "postgres",
 		"-p", "127.0.0.1::9000",
 		"-e", "POSTGRES_USER=integration", "-e", "POSTGRES_PASSWORD=integration-password", "-e", "POSTGRES_DB=app",
-		envOr("POSTGRES_TEST_IMAGE", "postgres:17"))
+		envOr("POSTGRES_TEST_IMAGE", "postgres:18"))
 	// Sharing one isolated network namespace also works on Docker hosts that
 	// disable communication between containers on a bridge network.
-	docker(t, ctx, "run", "-d", "--name", minio, "--network", "container:"+postgres,
+	// Silo retains MINIO_* settings; its distroless entrypoint runs the server
+	// directly, without a shell or bundled S3 client.
+	docker(t, ctx, "run", "-d", "--name", silo, "--network", "container:"+postgres,
 		"-e", "MINIO_ROOT_USER=integration", "-e", "MINIO_ROOT_PASSWORD=integration-password",
 		envOr("S3_TEST_IMAGE", defaultS3TestImage), "server", "/data")
 
@@ -66,7 +70,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		o.UsePathStyle = true
 		o.RetryMaxAttempts = 1
 	})
-	waitFor(t, ctx, "MinIO", func(ctx context.Context) error {
+	waitFor(t, ctx, "Silo", func(ctx context.Context) error {
 		_, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
 		return err
 	})
@@ -125,8 +129,8 @@ func TestDockerBackupRestore(t *testing.T) {
 	}
 
 	if !t.Run("timestamp_plaintext", func(t *testing.T) {
-		// MinIO rejects empty key path components; legacy repeated-slash S3 keys
-		// are covered by the unit/HTTP tests instead of this provider fixture.
+		// Leading/repeated-slash S3 keys are covered by the unit/HTTP tests;
+		// this provider fixture uses a prefix without empty path components.
 		env := map[string]string{"S3_PREFIX": "timestamp"}
 		// Exercise the default CMD as well as the legacy restore wrapper.
 		runBackupImage(t, env)

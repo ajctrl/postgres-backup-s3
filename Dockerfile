@@ -1,4 +1,4 @@
-ARG ALPINE_VERSION='3.21'
+ARG ALPINE_VERSION='3.23'
 ARG GO_VERSION='1.26'
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
@@ -14,8 +14,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/postgres-backup-s3 ./cmd/postgres-backup-s3
 
 FROM alpine:${ALPINE_VERSION}
+ARG POSTGRES_VERSION='18'
 COPY src/install.sh /install.sh
-RUN sh /install.sh && rm /install.sh
+RUN sh /install.sh "$POSTGRES_VERSION" && rm /install.sh
 COPY --from=build /out/postgres-backup-s3 /usr/local/bin/postgres-backup-s3
 
 ENV POSTGRES_DATABASE=''

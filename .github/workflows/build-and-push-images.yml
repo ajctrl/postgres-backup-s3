@@ -32,9 +32,7 @@ jobs:
     needs: test
     strategy:
       matrix:
-        include:
-          - { postgres: 17, alpine: '3.21' }
-          - { postgres: 18, alpine: '3.23' }
+        postgres: [17, 18]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,7 +44,7 @@ jobs:
           cache: true
 
       - name: Build the integration image
-        run: docker build --build-arg ALPINE_VERSION=${{ matrix.alpine }} -t postgres-backup-s3:go-migration .
+        run: docker build --build-arg POSTGRES_VERSION=${{ matrix.postgres }} -t postgres-backup-s3:go-migration .
 
       - name: Verify PostgreSQL and S3 backup/restore round trips
         env:
@@ -62,14 +60,7 @@ jobs:
 
     strategy:
       matrix:
-        include:
-          - { postgres: 12, alpine: '3.12' }
-          - { postgres: 13, alpine: '3.14' }
-          - { postgres: 14, alpine: '3.16' }
-          - { postgres: 15, alpine: '3.17' }
-          - { postgres: 16, alpine: '3.19' }
-          - { postgres: 17, alpine: '3.21' }
-          - { postgres: 18, alpine: '3.23' }
+        postgres: [17, 18]
 
     steps:
       - name: Checkout repository
@@ -125,7 +116,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
-            ALPINE_VERSION=${{ matrix.alpine }}
+            POSTGRES_VERSION=${{ matrix.postgres }}
           platforms: |
             linux/amd64
             linux/arm64

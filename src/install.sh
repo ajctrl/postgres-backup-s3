@@ -2,13 +2,25 @@
 
 set -eu
 
-# Older Alpine images retain their PostgreSQL client major version. Their GPG
-# package predates the separate gpg and gpg-agent packages.
-case "$(cat /etc/alpine-release)" in
-  3.[0-9].*|3.1[0-4].*)
-    apk add --no-cache postgresql-client gnupg ca-certificates
-    ;;
+postgres_version=${1:-}
+case "$postgres_version" in
+  17|18) ;;
   *)
-    apk add --no-cache postgresql-client gpg gpg-agent ca-certificates
+    echo 'POSTGRES_VERSION must be 17 or 18.' >&2
+    exit 1
     ;;
 esac
+
+apk add --no-cache "postgresql${postgres_version}-client" gpg gpg-agent ca-certificates
+
+# Fail the image build if PATH resolves a client from a different major version.
+for tool in psql pg_dump pg_restore; do
+  version=$("$tool" --version)
+  case "$version" in
+    *" $postgres_version."*) ;;
+    *)
+      printf 'Expected PostgreSQL %s client, got: %s\n' "$postgres_version" "$version" >&2
+      exit 1
+      ;;
+  esac
+done

@@ -17,7 +17,7 @@ The image combines a Go executable, AWS SDK for Go v2, PostgreSQL client tools a
 
 Use an existing PostgreSQL database and S3 bucket. The database must be reachable from the backup container, and the configured user must be able to read the selected database.
 
-Images use PostgreSQL major-version tags `12` through `18` and support `linux/amd64` and `linux/arm64`. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:18`; for a fork, use `ghcr.io/<owner>/<repository>:18` in lowercase after [publishing its images](#publishing-images).
+Images support PostgreSQL major-version tags `17` and `18` on `linux/amd64` and `linux/arm64`. Both use Alpine 3.23. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:18`; for a fork, use `ghcr.io/<owner>/<repository>:18` in lowercase after [publishing its images](#publishing-images).
 
 Create a `compose.yaml` for the backup service. Replace the example connection and bucket values. This example takes AWS access keys and an optional encryption passphrase from your shell or a `.env` file next to `compose.yaml`:
 
@@ -332,7 +332,7 @@ go vet ./...
 
 `-count=1` prevents stale results: the CLI built by the tests and externally built Docker images are not tracked as test dependencies. Regression tests use local HTTP servers and fake PostgreSQL/GPG commands, without AWS credentials.
 
-For actual PostgreSQL, GPG and MinIO round trips, use a local Docker daemon:
+For actual PostgreSQL, GPG and Silo round trips, use a local Docker daemon:
 
 ```sh
 docker build -t postgres-backup-s3:go-migration .
@@ -340,6 +340,8 @@ go test -count=1 -tags=integration -v -timeout=15m ./tests/integration
 ```
 
 The integration suite creates and removes disposable containers and a network. It checks plaintext restore, encrypted fixed-name version restore, repeated backups with a surviving GPG agent, and a multipart encrypted backup with an unwritable temporary directory. The latter restore checks row count and a checksum of all values. Tests use isolated credentials and do not contact AWS.
+
+The S3 fixture uses [Silo's distroless image](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z), pinned to the release's multi-platform digest. It starts with `server /data` and retains the `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` environment variables supported by Silo. Readiness and bucket setup use the test's AWS SDK client, so no shell, `curl`, or `mc` is needed inside the Silo container.
 
 ### Local executable
 
@@ -352,41 +354,37 @@ go build -o /tmp/postgres-backup-s3 ./cmd/postgres-backup-s3
 
 ### Docker builds
 
-The multistage build produces a stripped, static Go executable. The compiler and module cache stay in the build stage. The default runtime uses Alpine 3.21 and PostgreSQL client 17.
+The multistage build produces a stripped, static Go executable. The compiler and module cache stay in the build stage. The default runtime uses Alpine 3.23 and PostgreSQL client 18.
 
 ```sh
 docker build -t postgres-backup-s3:local .
-docker buildx build --platform linux/amd64,linux/arm64 --build-arg ALPINE_VERSION=3.21 .
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg POSTGRES_VERSION=17 .
 ```
 
-`ALPINE_VERSION` controls the PostgreSQL client major version:
+`POSTGRES_VERSION` explicitly selects the PostgreSQL client package, independently of `ALPINE_VERSION`. Only `17` and `18` are accepted. The image build verifies that `psql`, `pg_dump` and `pg_restore` resolve to the requested major version:
 
-| PostgreSQL tag | Alpine version |
-| --- | --- |
-| `12` | `3.12` |
-| `13` | `3.14` |
-| `14` | `3.16` |
-| `15` | `3.17` |
-| `16` | `3.19` |
-| `17` | `3.21` |
-| `18` | `3.23` |
+| PostgreSQL tag | Client package | Alpine version |
+| --- | --- | --- |
+| `17` | `postgresql17-client` | `3.23` |
+| `18` | `postgresql18-client` | `3.23` |
 
-Older Alpine releases preserve existing PostgreSQL tags; several are outside normal support. See [Alpine's support table](https://alpinelinux.org/releases/). Alpine 3.12 and 3.14 install `gnupg`; newer images use `gpg` and `gpg-agent`.
+PostgreSQL 12–16 images are no longer built, tested or updated. Previously published tags may remain in registries, but are unsupported. Both supported images install `gpg` and `gpg-agent` from Alpine 3.23; see [Alpine's support table](https://alpinelinux.org/releases/).
 
 ### Development settings
 
 | Variable / argument | Default | Scope |
 | --- | --- | --- |
 | `BACKUP_TEST_IMAGE` | `postgres-backup-s3:go-migration` | Environment variable for the Docker integration test. |
-| `POSTGRES_TEST_IMAGE` | `postgres:17` | Environment variable for the Docker integration test's PostgreSQL image. |
-| `S3_TEST_IMAGE` | MinIO image pinned by digest in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's S3 fixture. |
-| `ALPINE_VERSION` | `3.21` | Docker **build argument**, not a runtime environment variable. Selects the PostgreSQL client version. |
+| `POSTGRES_TEST_IMAGE` | `postgres:18` | Environment variable for the Docker integration test's PostgreSQL image; match the backup image's client major version. |
+| `S3_TEST_IMAGE` | Silo distroless image pinned by digest in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's S3 fixture; overrides must support `server /data` and the same credential variables. |
+| `ALPINE_VERSION` | `3.23` | Docker **build argument**, not a runtime environment variable. Selects the runtime base OS; does not select the PostgreSQL client version. |
+| `POSTGRES_VERSION` | `18` | Docker **build argument**, not a runtime environment variable. Selects client major `17` or `18`. |
 | `GO_VERSION` | `1.26` | Docker **build argument** selecting the builder's Go version. |
 | `BUILDPLATFORM`, `TARGETOS`, `TARGETARCH` | Supplied by Docker BuildKit | Build-platform inputs; select target architectures with `docker buildx build --platform`. |
 
 ### Repository Compose fixture
 
-The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 14 backup image and starts a development PostgreSQL server. It still needs an S3 bucket and credentials:
+The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 18 backup image on Alpine 3.23 and starts a PostgreSQL 18 development server. It still needs an S3 bucket and credentials:
 
 ```sh
 cp template.env .env
@@ -396,6 +394,8 @@ docker compose exec backup postgres-backup-s3 backup
 ```
 
 ## Compatibility
+
+Supported PostgreSQL image tags are now `17` and `18`; updates for tags `12`–`16` have ended. The default build and development Compose server have moved to PostgreSQL 18. Custom builds must use `POSTGRES_VERSION` to select the client major version; changing `ALPINE_VERSION` no longer selects it.
 
 The Go implementation preserves existing runtime configuration, `.dump` / `.dump.gpg` formats and shell entrypoints:
 
