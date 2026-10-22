@@ -2,3 +2,4 @@
 .env
 __pycache__/
 /postgres-backup-s3
+.tmp-go-check/
