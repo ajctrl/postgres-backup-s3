@@ -40,6 +40,9 @@ func TestUploadLimitReader(t *testing.T) {
 		want   string
 		err    error
 	}{
+		{"empty", func() io.Reader { return strings.NewReader("") }, "", errEmptyBackup},
+		{"initial failure", func() io.Reader { return iotest.ErrReader(sourceErr) }, "", sourceErr},
+		{"one byte with EOF", func() io.Reader { return iotest.DataErrReader(strings.NewReader("a")) }, "a", nil},
 		{"short", func() io.Reader { return strings.NewReader("abc") }, "abc", nil},
 		{"exact", func() io.Reader { return strings.NewReader("abcd") }, "abcd", nil},
 		{"exact with EOF", func() io.Reader { return iotest.DataErrReader(strings.NewReader("abcd")) }, "abcd", nil},

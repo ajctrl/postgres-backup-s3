@@ -17,6 +17,8 @@ const (
 	MaxUploadParts             int64 = 10000
 )
 
+var errEmptyBackup = errors.New("backup stream is empty")
+
 // Upload consumes and closes body. The producer must return EOF only after all
 // processing succeeds; a read error aborts the upload without publishing a key.
 func (s *S3) Upload(ctx context.Context, key string, body io.ReadCloser, options UploadOptions) error {
@@ -81,6 +83,7 @@ type uploadLimitReader struct {
 	reader    io.Reader
 	remaining int64
 	limitErr  error
+	hasData   bool
 }
 
 func (r *uploadLimitReader) Read(p []byte) (int, error) {
@@ -98,7 +101,12 @@ func (r *uploadLimitReader) Read(p []byte) (int, error) {
 		p = p[:r.remaining]
 	}
 	n, err := r.reader.Read(p)
-	r.remaining -= int64(n)
+	if n > 0 {
+		r.hasData = true
+		r.remaining -= int64(n)
+	} else if err == io.EOF && !r.hasData {
+		return 0, errEmptyBackup
+	}
 	return n, err
 }
 

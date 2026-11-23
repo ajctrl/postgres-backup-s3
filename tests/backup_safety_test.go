@@ -84,6 +84,47 @@ func TestInvalidDumpOutputNeverPublishes(t *testing.T) {
 	}
 }
 
+func TestEmptyBackupSkipsUploadAndRetention(t *testing.T) {
+	for _, tc := range []struct{ name, mode, versioning, allow string }{
+		{"versioned", "fixed", "Enabled", "false"},
+		{"overwrite", "fixed", "Suspended", "true"},
+		{"fallback", "fixed", "Suspended", "false"},
+		{"timestamp", "timestamp", "", "false"},
+	} {
+		for _, tool := range []string{"pg_dump", "gpg"} {
+			t.Run(tc.name+"/"+tool, func(t *testing.T) {
+				f := newFixture(t)
+				f.env["POSTGRES_DATABASE"], f.env["BACKUP_KEEP_DAYS"] = "app", "7"
+				f.env["BACKUP_FILENAME_MODE"], f.env["BACKUP_ALLOW_UNVERSIONED_OVERWRITE"] = tc.mode, tc.allow
+				f.s3.versioning = tc.versioning
+				f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
+				script := "#!/bin/sh\nexit 0\n"
+				wantError := "custom-format archive"
+				if tool == "gpg" {
+					f.env["PASSPHRASE"] = "test"
+					script = "#!/bin/sh\ncat >/dev/null\n"
+					wantError = "backup stream is empty"
+				}
+				if err := os.WriteFile(filepath.Join(f.dir, "bin", tool), []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
+				output := f.run(false, "backup")
+				if !strings.Contains(output, wantError) || !strings.Contains(output, "0 succeeded, 1 failed") || strings.Contains(output, "Backup complete") {
+					t.Fatalf("unexpected result for empty %s output: %s", tool, output)
+				}
+				// Only the pre-dump versioning check may reach S3.
+				calls := f.s3.calls("")
+				if tc.mode == "fixed" {
+					assertEqual(t, len(calls), 1)
+					assertEqual(t, calls[0].Query.Has("versioning"), true)
+				} else {
+					assertEqual(t, len(calls), 0)
+				}
+			})
+		}
+	}
+}
+
 func TestGPGPassphraseNeverAppearsInProcessArguments(t *testing.T) {
 	f := newFixture(t)
 	secret := "private-test-passphrase"
