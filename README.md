@@ -73,7 +73,7 @@ Set `POSTGRES_DATABASE` for one database, or use a comma-separated list:
 POSTGRES_DATABASES: "app,analytics,billing"
 ```
 
-`POSTGRES_DATABASES` takes precedence for backup. Lists are trimmed, empty entries are rejected, and duplicates are removed while preserving order. `ALL` is an ordinary name. Use `POSTGRES_DATABASE` or discovery for names containing commas; control characters are rejected.
+`POSTGRES_DATABASES` takes precedence for backup. Lists are trimmed, empty entries are rejected, and duplicates are removed while preserving order. The scheduler validates the selected names and exclusion list at startup. `ALL` is an ordinary name. Use `POSTGRES_DATABASE` or discovery for names containing commas; control characters are rejected.
 
 To discover databases at the start of every run, leave both selection variables empty and set:
 
@@ -97,6 +97,10 @@ Database discovery and source checks force `PGCLIENTENCODING=UTF8` and reject in
 
 These metadata connections also set `search_path` to `pg_catalog, pg_temp` after connecting and explicitly qualify built-in functions, catalog relations and types. Functions or aggregates created by other database users cannot replace the source checks or hide databases from discovery through schema search order. This overrides inherited search-path preferences only for metadata queries; other connection options, such as statement timeouts, are preserved.
 
+On PostgreSQL 17 and 18, a non-superuser dump role can read table data while omitting logical replication subscriptions. By default the backup stops before publication or retention if the actual dump reports this omission, including after a `--role` switch. Set `BACKUP_ALLOW_PARTIAL=true` to accept the omission. The strict check runs `pg_dump` with C-locale, uncolored diagnostics.
+
+By default, `pg_dump` waits up to five minutes to acquire its initial table locks. Override this with, for example, `PGDUMP_EXTRA_OPTS=--lock-wait-timeout=30s`. For backups that take longer than 24 hours, increase `BACKUP_DATABASE_TIMEOUT` to cover the expected dump and upload time.
+
 These are independent database snapshots, not one consistent snapshot across databases. Roles and tablespaces are not included; `pg_dumpall --globals-only` is outside this tool's scope.
 
 A container-wide lock at `/tmp/postgres-backup-s3.lock` covers discovery, dump, encryption, upload and retention, and is shared with restore. Overlapping backups or restores fail before accessing PostgreSQL or S3; they do not queue. Processes release the lock when they exit. Do not delete the lock file while either operation is running. Separate containers require a shared lock filesystem or external coordination; use one backup writer per S3 destination.
@@ -104,7 +108,9 @@ A container-wide lock at `/tmp/postgres-backup-s3.lock` covers discovery, dump, 
 ## Restore a database
 
 > [!CAUTION]
-> Restore replaces database objects in a single transaction. A failed restore rolls back its database changes; a successful restore replaces the existing data.
+> Restore replaces archived objects in the existing database in a single transaction. The target database keeps its own access privileges (including `CONNECT`), database-specific and role-in-database settings, and database comment. Objects created after the backup can remain. A failed restore rolls back its database changes.
+
+For a clean recovery, prepare an empty target database with the backed-up database name in a separate instance, configure its database-level privileges and settings, then run restore. Verify the data and access rules before directing applications to the recovered instance.
 
 Choose one existing target database using `POSTGRES_DATABASE`, even if the container backs up multiple or all databases. Use the same S3 prefix, filename mode and passphrase as the selected backup. Other database-selection settings are ignored during restore.
 
@@ -275,6 +281,7 @@ Image-publishing secrets belong to the GitHub repository and are listed under [p
 | `POSTGRES_USER` | Unset | Required for backup and restore. PostgreSQL login user. |
 | `POSTGRES_PASSWORD` | Unset | Required and nonempty for backup and restore. Passed to PostgreSQL tools as `PGPASSWORD`. |
 | `POSTGRES_DATABASE` | Unset | Single database to back up; required for restore. For backup, `POSTGRES_DATABASES` takes precedence. |
+| `BACKUP_DATABASE_TIMEOUT` | `24h` | Positive Go duration for one database's source check, dump, encryption and upload combined. Discovery has its own interval of the same length. After a database times out, its retention is skipped and the run continues with the next database. |
 | `POSTGRES_DATABASES` | Unset | Comma-separated backup targets. Surrounding whitespace is trimmed and duplicates are removed. |
 | `POSTGRES_BACKUP_ALL` | `false` | Discover all connectable, non-template databases. When `true`, both database-selection variables above must be empty. |
 | `POSTGRES_DATABASES_EXCLUDE` | Unset | Comma-separated, exact database names to exclude. Valid only with `POSTGRES_BACKUP_ALL=true`. |

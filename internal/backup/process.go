@@ -120,15 +120,16 @@ func commandError(ctx context.Context, name string, err error) error {
 }
 
 type pipelineCommand struct {
-	name           string
-	args           []string
-	passphrase     string
-	customDump     bool
-	rejectUnlogged bool
+	name                       string
+	args                       []string
+	passphrase                 string
+	customDump                 bool
+	rejectUnlogged             bool
+	rejectMissingSubscriptions bool
 }
 
 type synchronizedWriter struct {
-	mu  sync.Mutex
+	mu  *sync.Mutex
 	dst io.Writer
 }
 
@@ -138,13 +139,35 @@ func (w *synchronizedWriter) Write(p []byte) (int, error) {
 	return w.dst.Write(p)
 }
 
+// pg_dump 17 and 18 report this omission only on stderr, after applying
+// --role on the actual dump connection. Wait drains stderr before the
+// pipeline can signal a successful EOF to the uploader.
+const subscriptionWarning = "\npg_dump: warning: subscriptions not dumped because current user is not a superuser\n"
+
+type subscriptionGuard struct {
+	tail   []byte
+	cancel context.CancelCauseFunc
+}
+
+func (g *subscriptionGuard) Write(p []byte) (int, error) {
+	data := append(g.tail, p...)
+	if bytes.Contains(data, []byte(subscriptionWarning)) {
+		g.cancel(errors.New("pg_dump omitted subscriptions; use a superuser dump role or explicitly set BACKUP_ALLOW_PARTIAL=true"))
+	}
+	// A warning can span multiple writes. Keep only enough to match its prefix.
+	g.tail = append(g.tail[:0], data[max(0, len(data)-len(subscriptionWarning)+1):]...)
+	return len(p), nil
+}
+
 // pipeline waits for every process, including a producer that closes stdout
 // before reporting an error. Only its caller may signal EOF to the uploader.
 func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...pipelineCommand) (result error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	if r.stderr != nil {
-		r.stderr = &synchronizedWriter{dst: r.stderr}
+		if _, ok := r.stderr.(*synchronizedWriter); !ok {
+			r.stderr = &synchronizedWriter{new(sync.Mutex), r.stderr}
+		}
 	}
 	cmds := make([]*exec.Cmd, len(specs))
 	type copyTask struct {
@@ -181,6 +204,20 @@ func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...
 	defer closePipes()
 	for i, spec := range specs {
 		cmds[i] = r.command(ctx, spec.name, spec.args...)
+		if spec.rejectMissingSubscriptions {
+			cmd := cmds[i]
+			// LC_ALL overrides LC_MESSAGES. Preserve its character encoding
+			// for libpq users who select PGCLIENTENCODING=auto.
+			if locale := os.Getenv("LC_ALL"); locale != "" {
+				cmd.Env = append(cmd.Env, "LC_CTYPE="+locale)
+			}
+			cmd.Env = append(cmd.Env, "LC_ALL=", "LC_MESSAGES=C", "LANGUAGE=C", "PG_COLOR=never")
+			guard := &subscriptionGuard{tail: []byte{'\n'}, cancel: cancel}
+			cmd.Stderr = guard
+			if r.stderr != nil {
+				cmd.Stderr = io.MultiWriter(guard, r.stderr)
+			}
+		}
 		if spec.passphrase != "" {
 			secret, err := newPassphrasePipe(spec.passphrase)
 			if err != nil {
@@ -230,7 +267,7 @@ func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...
 	for i := len(cmds) - 1; i >= 0; i-- {
 		if err := cmds[i].Start(); err != nil {
 			result = commandError(ctx, specs[i].name, err)
-			cancel()
+			cancel(result)
 			break
 		}
 		started = append(started, i)
@@ -269,8 +306,11 @@ func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...
 	for range pending {
 		if err := <-done; err != nil {
 			result = errors.Join(result, err)
-			cancel()
+			cancel(err)
 		}
+	}
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(result, cause) {
+		return errors.Join(result, cause)
 	}
 	return result
 }

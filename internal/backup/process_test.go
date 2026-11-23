@@ -1,11 +1,48 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestAppAndChildShareLogLock(t *testing.T) {
+	var log bytes.Buffer
+	a := New(Config{}, nil, &log, &log)
+	done := make(chan error, 1)
+	go func() {
+		done <- a.runner(nil).pipeline(t.Context(), io.Discard, pipelineCommand{name: "sh", args: []string{"-c", "i=0; while [ $i -lt 1000 ]; do echo warning >&2; i=$((i+1)); done"}})
+	}()
+	for range 1000 {
+		io.WriteString(a.Out, "progress\n")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(log.String(), "warning\n") != 1000 || strings.Count(log.String(), "progress\n") != 1000 {
+		t.Fatal("concurrent log writes lost output")
+	}
+}
+
+func TestSubscriptionWarningAcrossWrites(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	g := &subscriptionGuard{tail: []byte{'\n'}, cancel: cancel}
+	line := subscriptionWarning[1:]
+	io.WriteString(g, "other output containing "+line)
+	if ctx.Err() != nil {
+		t.Fatal("matched text inside a different message")
+	}
+	for i := range len(line) {
+		g.Write([]byte{line[i]})
+	}
+	if ctx.Err() == nil {
+		t.Fatal("split warning failed to stop the pipeline")
+	}
+}
 
 func TestPipelineDrainsSlowOutputAfterProcessExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)

@@ -18,6 +18,7 @@ type Config struct {
 	RestoreNoOwner                                         bool
 	RestoreNoTablespaces, RestoreNoTableAccessMethod       bool
 	AllowPartial                                           bool
+	DatabaseTimeout                                        time.Duration
 	Storage                                                storage.Config
 }
 
@@ -72,6 +73,12 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 		return c, fmt.Errorf("S3_UPLOAD_PART_SIZE_MB must be an integer between 5 and 5120 (MiB).")
 	}
 	c.Storage.UploadPartSizeBytes = partSize * 1024 * 1024
+	if value := get("BACKUP_DATABASE_TIMEOUT"); value != "" {
+		c.DatabaseTimeout, err = time.ParseDuration(value)
+		if err != nil || c.DatabaseTimeout <= 0 {
+			return c, fmt.Errorf("BACKUP_DATABASE_TIMEOUT must be a positive duration such as 30m or 24h.")
+		}
+	}
 	for _, setting := range []struct {
 		name string
 		dest *bool
@@ -111,11 +118,19 @@ func (c Config) validateBackup() (int, error) {
 		if c.Database == "" && c.Databases == "" {
 			return 0, fmt.Errorf("Set POSTGRES_DATABASE, POSTGRES_DATABASES, or POSTGRES_BACKUP_ALL=true.")
 		}
+		if err := validateDatabases(c.explicitDatabases()); err != nil {
+			return 0, err
+		}
 	default:
 		return 0, fmt.Errorf("POSTGRES_BACKUP_ALL must be true or false.")
 	}
-	if c.Exclude != "" && c.BackupAll != "true" {
-		return 0, fmt.Errorf("POSTGRES_DATABASES_EXCLUDE requires POSTGRES_BACKUP_ALL=true.")
+	if c.Exclude != "" {
+		if c.BackupAll != "true" {
+			return 0, fmt.Errorf("POSTGRES_DATABASES_EXCLUDE requires POSTGRES_BACKUP_ALL=true.")
+		}
+		if err := validateDatabases(parseDatabaseList(c.Exclude)); err != nil {
+			return 0, err
+		}
 	}
 	if c.KeepDays == "" {
 		return 0, nil
@@ -128,6 +143,13 @@ func (c Config) validateBackup() (int, error) {
 		return 0, fmt.Errorf("BACKUP_KEEP_DAYS must be at most 36500.")
 	}
 	return days, nil
+}
+
+func (c Config) explicitDatabases() []string {
+	if c.Databases != "" {
+		return parseDatabaseList(c.Databases)
+	}
+	return []string{c.Database}
 }
 
 func parseDatabaseList(value string) []string {

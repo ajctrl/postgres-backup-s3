@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata"
 
@@ -25,7 +26,21 @@ type App struct {
 }
 
 func New(c Config, store storage.Store, out, stderr io.Writer) *App {
-	return &App{Config: c, Store: store, Out: out, Err: stderr, now: time.Now, lockPath: "/tmp/postgres-backup-s3.lock"}
+	if c.DatabaseTimeout == 0 {
+		c.DatabaseTimeout = 24 * time.Hour
+	}
+	// Callers can route both streams to the same non-concurrent writer.
+	mu := new(sync.Mutex)
+	logWriter := func(dst io.Writer) io.Writer {
+		if dst == nil {
+			return io.Discard
+		}
+		return &synchronizedWriter{mu: mu, dst: dst}
+	}
+	return &App{
+		Config: c, Store: store, Out: logWriter(out), Err: logWriter(stderr),
+		now: time.Now, lockPath: "/tmp/postgres-backup-s3.lock",
+	}
 }
 
 func scheduleParser() cron.Parser {
@@ -122,7 +137,9 @@ func (a *App) Backup(ctx context.Context) error {
 			return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
 		}
 	}
-	databases, err := a.databases(ctx, runner)
+	discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, a.Config.DatabaseTimeout)
+	databases, err := a.databases(discoveryCtx, runner)
+	cancelDiscovery()
 	if err != nil {
 		return err
 	}
@@ -136,7 +153,9 @@ func (a *App) Backup(ctx context.Context) error {
 			return errClockRollback
 		}
 		checkClock := func() error { return a.checkClock(databaseStarted) }
-		key, err := a.backupDatabase(ctx, runner, database, databaseStarted)
+		dbCtx, cancelDatabase := context.WithTimeout(ctx, a.Config.DatabaseTimeout)
+		key, err := a.backupDatabase(dbCtx, runner, database, databaseStarted, opts)
+		cancelDatabase()
 		if err != nil {
 			fmt.Fprintf(a.Err, "Backup failed: %s: %v\n", database, err)
 			if errors.Is(err, errClockRollback) {
@@ -183,21 +202,15 @@ func (a *App) databases(ctx context.Context, runner commandRunner) ([]string, er
 		if err := runner.queryJSON(ctx, &names, args...); err != nil {
 			return nil, fmt.Errorf("Could not discover databases: %w", err)
 		}
-	} else if c.Databases != "" {
-		names = parseDatabaseList(c.Databases)
+		if err := validateDatabases(names); err != nil {
+			return nil, err
+		}
 	} else {
-		names = []string{c.Database}
-	}
-	if err := validateDatabases(names); err != nil {
-		return nil, err
+		names = c.explicitDatabases()
 	}
 	excluded := make(map[string]bool)
 	if c.Exclude != "" {
-		list := parseDatabaseList(c.Exclude)
-		if err := validateDatabases(list); err != nil {
-			return nil, err
-		}
-		for _, name := range list {
+		for _, name := range parseDatabaseList(c.Exclude) {
 			excluded[name] = true
 		}
 	}
@@ -227,7 +240,7 @@ func (a *App) checkClock(started time.Time) error {
 	return nil
 }
 
-func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database string, started time.Time) (string, error) {
+func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database string, started time.Time, opts *dumpOptions) (string, error) {
 	key, err := a.Config.backupKey(database, started)
 	if err != nil {
 		return "", err
@@ -237,12 +250,9 @@ func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database
 		return "", err
 	}
 	fmt.Fprintf(a.Out, "Creating backup of %s database...\n", database)
-	args := append([]string{"--format=custom"}, a.dumpConnectionArgs(database, standby)...)
-	opts, err := parseDumpOptions(a.Config.DumpOptions, a.Config.AllowPartial)
-	if err != nil {
-		return "", err
-	}
-	commands := []pipelineCommand{{name: "pg_dump", args: append(args, opts.args...), customDump: true, rejectUnlogged: standby && !a.Config.AllowPartial}}
+	args := append([]string{"--format=custom", "--lock-wait-timeout=5min"}, a.dumpConnectionArgs(database, standby)...)
+	commands := []pipelineCommand{{name: "pg_dump", args: append(args, opts.args...), customDump: true,
+		rejectUnlogged: standby && !a.Config.AllowPartial, rejectMissingSubscriptions: !a.Config.AllowPartial}}
 	if a.Config.Passphrase != "" {
 		fmt.Fprintf(a.Out, "Encrypting backup of %s...\n", database)
 		commands = append(commands, pipelineCommand{name: "gpg", passphrase: a.Config.Passphrase, args: []string{
@@ -264,8 +274,13 @@ func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database
 	}()
 	fmt.Fprintf(a.Out, "Uploading backup of %s...\n", database)
 	uploadErr := a.Store.Upload(ctx, key, reader, storage.UploadOptions{
-		IfAbsent:      a.Config.FilenameMode != "fixed",
-		BeforePublish: func() error { return a.checkClock(started) },
+		IfAbsent: a.Config.FilenameMode != "fixed",
+		BeforePublish: func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return a.checkClock(started)
+		},
 	})
 	// An upload failure must stop both pg_dump and GPG and release backpressure.
 	if uploadErr != nil {
@@ -273,6 +288,9 @@ func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database
 		reader.CloseWithError(uploadErr)
 	}
 	if err := errors.Join(uploadErr, <-done); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if err := a.checkClock(started); err != nil {
@@ -431,7 +449,7 @@ func (a *App) Restore(ctx context.Context, args []string) error {
 		if err := runner.restore(ctx, args...); err != nil {
 			return err
 		}
-		fmt.Fprintln(a.Out, "Restore complete.")
+		fmt.Fprintln(a.Out, "Restore complete. Restored archived objects in the existing database. Database-level privileges, settings and comments remain those of the target. Additional objects can remain.")
 		return nil
 	})
 }

@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
@@ -29,6 +30,100 @@ func (s *capturedBackupStore) Upload(ctx context.Context, key string, body io.Re
 func testBackupSafetyWithPostgreSQL(t *testing.T, dir, bin string, connection []string,
 	run func(string, ...string) []byte, sql func(string, string) string) {
 	t.Helper()
+	t.Run("subscriptions-use-effective-dump-role", func(t *testing.T) {
+		sql("postgres", "CREATE ROLE subscription_reader LOGIN")
+		defer sql("postgres", "DROP ROLE subscription_reader")
+		sql("postgres", "GRANT pg_read_all_data TO subscription_reader")
+		sql("postgres", "CREATE DATABASE subscription_source")
+		defer sql("postgres", "DROP DATABASE subscription_source")
+		sql("subscription_source", "CREATE TABLE probe(id integer)")
+		sql("subscription_source", "CREATE SUBSCRIPTION sub_probe CONNECTION 'dbname=postgres' PUBLICATION pub_probe WITH (connect=false, slot_name=NONE)")
+		defer sql("subscription_source", "DROP SUBSCRIPTION sub_probe")
+		t.Setenv("PG_COLOR", "always")
+		for _, tc := range []struct {
+			user, options                           string
+			allowPartial, success, wantSubscription bool
+		}{
+			{"subscription_reader", "", false, false, false},
+			{"restore_test", "--role=subscription_reader", false, false, false},
+			{"restore_test", "--role subscription_reader", true, true, false},
+			{"restore_test", "", false, true, true},
+		} {
+			var log bytes.Buffer
+			s := &capturedBackupStore{}
+			a := New(Config{Database: "subscription_source", BackupAll: "false", Host: dir, Port: "55440",
+				User: tc.user, DumpOptions: tc.options, AllowPartial: tc.allowPartial, FilenameMode: "timestamp", KeepDays: "7"}, s, &log, &log)
+			a.lockPath = filepath.Join(dir, "backup.lock")
+			err := a.Backup(t.Context())
+			if (err == nil) != tc.success || (s.published == 1) != tc.success || (s.prefix != "") != tc.success {
+				t.Fatalf("user=%s opts=%q partial=%v: err=%v published=%d listed=%q\n%s", tc.user, tc.options, tc.allowPartial, err, s.published, s.prefix, &log)
+			}
+			if !tc.success {
+				if !strings.Contains(log.String(), "pg_dump omitted subscriptions") {
+					t.Fatalf("missing omission diagnostic: %s", &log)
+				}
+				continue
+			}
+			path := filepath.Join(t.TempDir(), "subscriptions.dump")
+			if err := os.WriteFile(path, s.archive.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			toc := string(run("pg_restore", "--list", path))
+			if strings.Contains(toc, " SUBSCRIPTION - sub_probe ") != tc.wantSubscription {
+				t.Fatalf("unexpected subscription in archive for user %s options %q:\n%s", tc.user, tc.options, toc)
+			}
+		}
+	})
+
+	t.Run("lock-timeout-continues-with-next-database", func(t *testing.T) {
+		sql("postgres", "CREATE DATABASE locked_source")
+		defer sql("postgres", "DROP DATABASE locked_source")
+		sql("locked_source", "CREATE TABLE probe(id integer)")
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		holder := exec.CommandContext(ctx, filepath.Join(bin, "psql"), append(append([]string{}, connection...), "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", "locked_source")...)
+		in, err := holder.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := holder.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		holder.Stderr = os.Stderr
+		if err := holder.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			in.Close()
+			holder.Wait()
+		}()
+		if _, err := io.WriteString(in, "BEGIN; LOCK TABLE probe IN ACCESS EXCLUSIVE MODE; SELECT 'locked';\n"); err != nil {
+			t.Fatal(err)
+		}
+		if line, err := bufio.NewReader(out).ReadString('\n'); err != nil || line != "locked\n" {
+			t.Fatalf("lock acquisition: %q, %v", line, err)
+		}
+		s := &publishingStore{}
+		var log bytes.Buffer
+		a := New(Config{Databases: "locked_source,postgres", BackupAll: "false", Host: dir, Port: "55440", User: "restore_test",
+			DatabaseTimeout: 2 * time.Second, FilenameMode: "timestamp", KeepDays: "7"}, s, &log, &log)
+		a.lockPath = filepath.Join(dir, "backup.lock")
+		if err := a.Backup(ctx); err == nil || s.published != 1 || s.prefix != a.Config.timestampPrefix("postgres") || !strings.Contains(log.String(), "deadline exceeded") {
+			t.Fatalf("backup after lock timeout: %v, published=%d prefix=%q\n%s", err, s.published, s.prefix, &log)
+		}
+		log.Reset()
+		a.Config.DumpOptions = "--lock-wait-timeout=200ms"
+		a.Config.DatabaseTimeout = 10 * time.Second
+		if err := a.Backup(ctx); err == nil || s.published != 2 || strings.Contains(log.String(), "deadline exceeded") || !strings.Contains(log.String(), "timeout") {
+			t.Fatalf("pg_dump lock timeout override: %v, published=%d\n%s", err, s.published, &log)
+		}
+		a.Config.Databases = "postgres"
+		if err := a.Backup(ctx); err != nil || s.published != 3 {
+			t.Fatalf("next backup could not complete: %v\n%s", err, &log)
+		}
+	})
+
 	t.Run("discovery-overrides-latin1", func(t *testing.T) {
 		sql("postgres", `CREATE DATABASE "café"`)
 		defer sql("postgres", `DROP DATABASE "café"`)
@@ -196,9 +291,8 @@ func testDumpConnectionRoles(t *testing.T, dir, bin string, sql func(string, str
 			}
 			store := &capturedBackupStore{}
 			var log bytes.Buffer
-			output := &synchronizedWriter{dst: &log}
 			a := New(Config{Database: "unlogged_source", BackupAll: "false", Host: host, Port: tc.dumpPorts, User: "restore_test",
-				FilenameMode: "timestamp", KeepDays: "7", AllowPartial: tc.partial}, store, output, output)
+				FilenameMode: "timestamp", KeepDays: "7", AllowPartial: tc.partial}, store, &log, &log)
 			a.lockPath = filepath.Join(dir, "backup.lock")
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
@@ -215,7 +309,7 @@ func testDumpConnectionRoles(t *testing.T, dir, bin string, sql func(string, str
 			sql("postgres", "CREATE DATABASE role_restored")
 			defer sql("postgres", "DROP DATABASE role_restored")
 			restore := New(Config{Database: "role_restored", Host: dir, Port: "55440", User: "restore_test", FilenameMode: "fixed"},
-				&archiveDownloadStore{archive: store.archive.Bytes()}, output, output)
+				&archiveDownloadStore{archive: store.archive.Bytes()}, &log, &log)
 			restore.lockPath = a.lockPath
 			if err := restore.Restore(ctx, nil); err != nil {
 				t.Fatalf("restore: %v\n%s", err, &log)

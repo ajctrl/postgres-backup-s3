@@ -1,6 +1,8 @@
 package backup
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,15 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	}
 	if _, err := load(map[string]string{"BACKUP_FILENAME_MODE": "wrong"}); err == nil {
 		t.Fatal("accepted unknown filename mode")
+	}
+	c, err = load(map[string]string{"BACKUP_DATABASE_TIMEOUT": "90m"})
+	if err != nil || c.DatabaseTimeout != 90*time.Minute {
+		t.Fatalf("database timeout: %s, %v", c.DatabaseTimeout, err)
+	}
+	for _, value := range []string{"0", "-1s", "60", "invalid"} {
+		if _, err := load(map[string]string{"BACKUP_DATABASE_TIMEOUT": value}); err == nil {
+			t.Errorf("accepted invalid database timeout %q", value)
+		}
 	}
 }
 
@@ -114,6 +125,23 @@ func TestScheduleCompatibility(t *testing.T) {
 	for _, spec := range []string{"", "garbage", "* *", "61 * * * * *"} {
 		if _, err := scheduleParser().Parse(spec); err == nil {
 			t.Errorf("accepted invalid schedule %q", spec)
+		}
+	}
+}
+
+func TestInvalidSelectionFailsBeforeScheduling(t *testing.T) {
+	for _, c := range []Config{
+		{BackupAll: "false", Databases: "app,,billing"},
+		{BackupAll: "false", Database: "app\nbilling"},
+		{BackupAll: "true", Exclude: "scratch,"},
+	} {
+		c.Schedule = "@weekly"
+		var log bytes.Buffer
+		a := New(c, nil, &log, &log)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel() // A regression would otherwise wait for the scheduler.
+		if err := a.Run(ctx); err == nil || !strings.Contains(err.Error(), "Database names") || log.Len() != 0 {
+			t.Fatalf("invalid scheduled selection: err=%v log=%q", err, &log)
 		}
 	}
 }

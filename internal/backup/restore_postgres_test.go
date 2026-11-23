@@ -86,6 +86,9 @@ func TestRestorePlacementWithPostgreSQL(t *testing.T) {
 	}
 	sql("postgres", "CREATE TABLESPACE restore_space LOCATION '"+strings.ReplaceAll(space, "'", "''")+"'")
 	sql("postgres", "CREATE DATABASE source")
+	sql("source", `REVOKE CONNECT ON DATABASE source FROM PUBLIC;
+ALTER DATABASE source SET timezone = 'UTC';
+COMMENT ON DATABASE source IS 'source comment';`)
 	sql("source", `CREATE ACCESS METHOD restore_heap TYPE TABLE HANDLER heap_tableam_handler;
 CREATE TABLE probe(v double precision) USING restore_heap TABLESPACE restore_space;
 INSERT INTO probe VALUES (1.2345678901234567);`)
@@ -105,6 +108,9 @@ INSERT INTO probe VALUES (1.2345678901234567);`)
 		t.Run(tc.name, func(t *testing.T) {
 			sql("postgres", "CREATE DATABASE restored")
 			defer sql("postgres", "DROP DATABASE restored")
+			sql("restored", `ALTER DATABASE restored SET timezone = 'Asia/Tokyo';
+COMMENT ON DATABASE restored IS 'target comment';
+CREATE TABLE target_only(id integer);`)
 			sql("restored", "CREATE TABLE probe(v double precision); INSERT INTO probe VALUES (99)")
 			env := map[string]string{
 				"S3_BUCKET": "test", "POSTGRES_HOST": dir, "POSTGRES_PORT": "55440",
@@ -133,6 +139,12 @@ INSERT INTO probe VALUES (1.2345678901234567);`)
 			}
 			if err != nil {
 				t.Fatalf("restore: %v\n%s", err, &stderr)
+			}
+			properties := sql("restored", `SELECT datacl IS NULL, current_setting('TimeZone'),
+shobj_description(oid, 'pg_database'), to_regclass('target_only') IS NOT NULL
+FROM pg_database WHERE datname = current_database()`)
+			if properties != "t|Asia/Tokyo|target comment|t" {
+				t.Fatalf("existing target properties or extra table changed: %s", properties)
 			}
 			if got := sql("restored", "SELECT encode(float8send(v), 'hex') FROM probe"); got != wantBits {
 				t.Fatalf("floating-point value changed: %s, want %s", got, wantBits)
