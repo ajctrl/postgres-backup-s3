@@ -12,7 +12,6 @@ import (
 	"time"
 	_ "time/tzdata"
 
-	"github.com/aws/smithy-go"
 	"github.com/bartels/postgres-backup-s3/internal/storage"
 	"github.com/robfig/cron/v3"
 )
@@ -93,7 +92,8 @@ func withWorkspace(action func(string) error) (err error) {
 	return action(dir)
 }
 
-func (a *App) Backup(ctx context.Context) error {
+// Each run resolves its own filename mode without changing the scheduler's configuration.
+func (a App) Backup(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -125,17 +125,9 @@ func (a *App) Backup(ctx context.Context) error {
 	if opts.partial {
 		fmt.Fprintln(a.Err, "WARNING: partial database backup explicitly enabled; selected contents may omit data, definitions, or dependencies needed for restore.")
 	}
-	if a.Config.FilenameMode == "fixed" {
-		enabled, err := a.Store.VersioningEnabled(ctx)
-		if err != nil {
-			var apiErr smithy.APIError
-			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "AccessDenied" {
-				return fmt.Errorf("Could not verify S3 bucket versioning: %w", err)
-			}
-			fmt.Fprintf(a.Err, "Warning: Could not verify S3 bucket versioning: %v. Continuing backup; ensure bucket versioning is Enabled to retain previous fixed-name backups.\n", err)
-		} else if !enabled {
-			return fmt.Errorf("Fixed filenames require S3 bucket versioning to be Enabled.")
-		}
+	a.Config.FilenameMode = a.backupFilenameMode(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, a.Config.DatabaseTimeout)
 	databases, err := a.databases(discoveryCtx, runner)
@@ -186,6 +178,26 @@ func (a *App) Backup(ctx context.Context) error {
 		return fmt.Errorf("backup run completed with failures")
 	}
 	return nil
+}
+
+func (a *App) backupFilenameMode(ctx context.Context) string {
+	if a.Config.FilenameMode != "fixed" {
+		return "timestamp"
+	}
+	enabled, err := a.Store.VersioningEnabled(ctx)
+	if err == nil && enabled {
+		return "fixed"
+	}
+	reason := "S3 bucket versioning is not Enabled"
+	if err != nil {
+		reason = fmt.Sprintf("could not verify S3 bucket versioning: %v", err)
+	}
+	if a.Config.AllowUnversionedOverwrite {
+		fmt.Fprintf(a.Err, "WARNING: %s. BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true permits overwriting fixed keys for this run. Previous backups may be lost.\n", reason)
+		return "fixed"
+	}
+	fmt.Fprintf(a.Err, "WARNING: %s. Using timestamped keys for this run.\n", reason)
+	return "timestamp"
 }
 
 func (a *App) connectionArgs(database string) []string {
@@ -297,6 +309,11 @@ func (a *App) backupDatabase(ctx context.Context, runner commandRunner, database
 		return "", err
 	}
 	fmt.Fprintf(a.Out, "Backup complete: %s; key: %s\n", database, key)
+	if a.Config.FilenameMode == "timestamp" {
+		generation := strings.TrimSuffix(strings.TrimPrefix(key, a.Config.timestampPrefix(database)), a.Config.fileType())
+		quotedDB := "'" + strings.ReplaceAll(database, "'", "'\\''") + "'"
+		fmt.Fprintf(a.Out, "Restore in backup container: POSTGRES_DATABASE=%s BACKUP_FILENAME_MODE=timestamp postgres-backup-s3 restore %s\n", quotedDB, generation)
+	}
 	return key, nil
 }
 

@@ -16,6 +16,8 @@ services:
     environment:
       SCHEDULE: '@weekly'     # optional
       BACKUP_KEEP_DAYS: 7     # optional; deletes expired timestamped backups ONLY
+      BACKUP_FILENAME_MODE: "${BACKUP_FILENAME_MODE:-timestamp}"
+      BACKUP_ALLOW_UNVERSIONED_OVERWRITE: "${BACKUP_ALLOW_UNVERSIONED_OVERWRITE-false}"
       PASSPHRASE: passphrase  # optional
       S3_REGION:
       S3_ACCESS_KEY_ID:

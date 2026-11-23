@@ -44,6 +44,7 @@ ENV SCHEDULE=''
 ENV PASSPHRASE=''
 ENV BACKUP_KEEP_DAYS=''
 ENV BACKUP_FILENAME_MODE='timestamp'
+ENV BACKUP_ALLOW_UNVERSIONED_OVERWRITE='false'
 
 COPY src/run.sh src/backup.sh src/restore.sh /
 

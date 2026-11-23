@@ -189,6 +189,9 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if action == s.fail || (action == "PUT" && s.uploadFailure != "" && strings.Contains(key, s.uploadFailure)) {
 		code := s.failCode
+		if code == "disconnect" {
+			panic(http.ErrAbortHandler)
+		}
 		if code == "" {
 			code = "AccessDenied"
 		}
@@ -551,6 +554,9 @@ func TestInvalidSelectionAndRetentionNeverAccessDatabaseOrS3(t *testing.T) {
 		{"POSTGRES_DATABASE": "app", "POSTGRES_DATABASES_EXCLUDE": "other"},
 		{"POSTGRES_DATABASE": "app", "BACKUP_FILENAME_MODE": "wrong"},
 	}
+	for _, value := range []string{"", "TRUE", "1", "yes", "false "} {
+		cases = append(cases, map[string]string{"POSTGRES_DATABASE": "app", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE": value})
+	}
 	for _, value := range []string{"0", "-1", "abc", "08", "1.5", "999999999999"} {
 		for _, mode := range []string{"timestamp", "fixed"} {
 			cases = append(cases, map[string]string{"POSTGRES_DATABASE": "app", "BACKUP_FILENAME_MODE": mode, "BACKUP_KEEP_DAYS": value})
@@ -628,45 +634,59 @@ func TestFixedKeysEncodingEncryptionAndVersionRestore(t *testing.T) {
 	}
 }
 
-func TestFixedBackupRequiresEnabledVersioning(t *testing.T) {
-	for _, status := range []string{"", "Suspended", "SignatureDoesNotMatch"} {
-		t.Run(status, func(t *testing.T) {
-			f := newFixture(t)
-			f.env["POSTGRES_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
-			f.s3.versioning = status
-			if status == "SignatureDoesNotMatch" {
-				f.s3.fail = "versioning"
-				f.s3.failCode = status
-			}
-			f.run(false, "backup")
-			assertEqual(t, len(f.processes("pg_dump")), 0)
-			assertEqual(t, len(f.s3.calls("PUT")), 0)
-		})
-	}
-}
-
-func TestFixedBackupContinuesWhenVersioningAccessDenied(t *testing.T) {
-	f := newFixture(t)
-	f.env["POSTGRES_DATABASES"], f.env["BACKUP_FILENAME_MODE"] = "app,billing", "fixed"
-	f.s3.fail = "versioning"
-	cmd := f.command("backup")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("backup failed: %v\n%s\n%s", err, &stdout, &stderr)
-	}
-	f.assertClean()
-	for _, want := range []string{"Warning:", "AccessDenied", "Continuing backup", "ensure bucket versioning is Enabled"} {
-		if !strings.Contains(stderr.String(), want) {
-			t.Errorf("stderr missing %q: %s", want, &stderr)
+func TestBackupFilenameModeForRun(t *testing.T) {
+	for _, tc := range []struct{ mode, status, failure, reason string }{
+		{"fixed", "Enabled", "", ""},
+		{"fixed", "Suspended", "", "versioning is not Enabled"},
+		{"fixed", "", "", "versioning is not Enabled"},
+		{"fixed", "", "AccessDenied", "AccessDenied"},
+		{"fixed", "", "disconnect", "could not verify S3 bucket versioning"},
+		{"timestamp", "", "AccessDenied", ""},
+	} {
+		for _, allow := range []string{"unset", "false", "true"} {
+			t.Run(strings.Join([]string{tc.mode, tc.status, tc.failure, allow}, "/"), func(t *testing.T) {
+				f := newFixture(t)
+				f.env["POSTGRES_DATABASES"], f.env["BACKUP_FILENAME_MODE"] = "app,billing", tc.mode
+				f.env["AWS_MAX_ATTEMPTS"] = "1"
+				if allow != "unset" {
+					f.env["BACKUP_ALLOW_UNVERSIONED_OVERWRITE"] = allow
+				}
+				f.s3.versioning = tc.status
+				if tc.failure != "" {
+					f.s3.fail, f.s3.failCode = "versioning", tc.failure
+				}
+				output := f.run(true, "backup")
+				if tc.mode == "fixed" {
+					assertEqual(t, len(f.s3.calls("versioning")), 1)
+					assertEqual(t, f.s3.calls("")[0].Query.Has("versioning"), true)
+				} else {
+					assertEqual(t, len(f.s3.calls("versioning")), 0)
+				}
+				fixed := tc.mode == "fixed" && (tc.status == "Enabled" || allow == "true")
+				if tc.reason != "" {
+					assertEqual(t, strings.Count(output, "WARNING:"), 1)
+					assertEqual(t, strings.Contains(output, tc.reason), true)
+					assertEqual(t, strings.Contains(output, "permits overwriting fixed keys"), fixed)
+					assertEqual(t, strings.Contains(output, "Using timestamped keys"), !fixed)
+				} else {
+					assertEqual(t, strings.Contains(output, "WARNING:"), false)
+				}
+				puts := f.s3.calls("PUT")
+				assertEqual(t, len(puts), 2)
+				for i, db := range []string{"app", "billing"} {
+					put := puts[i]
+					assertEqual(t, strings.Contains(output, "key: "+put.Key+"\n"), true)
+					if fixed {
+						assertEqual(t, put.Key, "backup/"+db+".dump")
+						assertEqual(t, put.IfNoneMatch, "")
+					} else {
+						assertEqual(t, strings.HasPrefix(put.Key, "backup/"+db+"/"), true)
+						assertEqual(t, put.IfNoneMatch, "*")
+					}
+				}
+			})
 		}
 	}
-	if !strings.Contains(stdout.String(), "2 succeeded, 0 failed, 0 retention cleanups failed") {
-		t.Errorf("incorrect backup summary: %s", &stdout)
-	}
-	assertEqual(t, len(f.s3.calls("versioning")), 1)
-	assertEqual(t, f.databaseCalls("pg_dump"), []string{"app", "billing"})
-	assertEqual(t, keys(f.s3.calls("PUT")), []string{"backup/app.dump", "backup/billing.dump"})
 }
 
 func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {

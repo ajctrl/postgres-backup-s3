@@ -17,7 +17,7 @@ type Config struct {
 	Prefix, Passphrase, KeepDays, FilenameMode, Schedule   string
 	RestoreNoOwner                                         bool
 	RestoreNoTablespaces, RestoreNoTableAccessMethod       bool
-	AllowPartial                                           bool
+	AllowPartial, AllowUnversionedOverwrite                bool
 	DatabaseTimeout                                        time.Duration
 	Storage                                                storage.Config
 }
@@ -67,6 +67,12 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed.")
+	}
+	if value, set := lookup("BACKUP_ALLOW_UNVERSIONED_OVERWRITE"); set {
+		if value != "true" && value != "false" {
+			return c, fmt.Errorf("BACKUP_ALLOW_UNVERSIONED_OVERWRITE must be true or false.")
+		}
+		c.AllowUnversionedOverwrite = value == "true"
 	}
 	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
 	if err != nil || partSize < 5 || partSize > 5120 {

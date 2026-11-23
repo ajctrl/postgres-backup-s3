@@ -38,6 +38,8 @@ services:
       S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}"
       SCHEDULE: "0 2 * * *"
       BACKUP_KEEP_DAYS: "7"
+      BACKUP_FILENAME_MODE: "${BACKUP_FILENAME_MODE:-timestamp}"
+      BACKUP_ALLOW_UNVERSIONED_OVERWRITE: "${BACKUP_ALLOW_UNVERSIONED_OVERWRITE-false}"
       PASSPHRASE: "${PASSPHRASE:-}"
 ```
 
@@ -217,7 +219,7 @@ Use a separate `S3_PREFIX` per PostgreSQL server to avoid collisions between dat
 | `BACKUP_FILENAME_MODE` | Example key with `S3_PREFIX=backup` | Requirements |
 | --- | --- | --- |
 | `timestamp` (default) | `backup/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | UTC timestamp captured before each database dump plus a cryptographically random 128-bit generation ID. Existing generation keys cannot be overwritten. |
-| `fixed` | `backup/app.dump` | Bucket versioning must be `Enabled`. |
+| `fixed` | `backup/app.dump` | Uses the fixed key when versioning is confirmed or unversioned overwrite is explicitly allowed. Otherwise uses a timestamped key. |
 
 Encryption adds `.gpg` in either mode. Both modes percent-encode the database name: `a/b` becomes `a%2Fb`. Timestamp mode stores backups in a database directory; fixed mode stores `<encoded-database>.dump` directly under the prefix. This keeps fixed keys separate from timestamped backups.
 
@@ -229,7 +231,15 @@ Prefix separator handling remains unchanged:
 | `backup/` | `backup//app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/app.dump` |
 | Empty | `/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `app.dump` |
 
-Fixed mode checks versioning before every backup run and rejects disabled or suspended versioning. If `GetBucketVersioning` returns `AccessDenied` (HTTP 403), it logs a warning to stderr and continues the backup without verifying versioning. Other verification errors stop the backup. When the check is denied, ensure versioning is enabled to retain previous fixed-name backups. S3-compatible providers must support versioned objects. Keep versioning enabled throughout operation; the initial check cannot prevent later administrative changes.
+In fixed mode, each run calls `GetBucketVersioning` before the first dump and applies the result to every selected database. Custom S3 endpoints, including IDrive e2, use the same API. Timestamp mode skips this check.
+
+| Versioning check in fixed mode | `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` unset or `false` | `BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true` |
+| --- | --- | --- |
+| `Enabled` | Fixed key | Fixed key |
+| `Suspended` or successful response without `Status` | Log the reason and use timestamped keys | Warn and overwrite fixed keys |
+| Check failed (for example, `AccessDenied` or a network error) | Log the error and use timestamped keys | Warn and overwrite fixed keys |
+
+After a timestamped upload succeeds, the log prints the actual key and a command to restore that exact generation in the backup container. After a fallback, an argument-free restore in fixed mode still reads the previous fixed object, if one exists. Use the logged command with the same S3 settings and passphrase. Upload errors count as backup failures in either mode.
 
 Timestamp mode sends `If-None-Match: *` when publishing either a single-request upload or a completed multipart upload. A collision fails the backup and skips retention for that database; multipart data is aborted. The provider must enforce these conditional writes. No existence-check-then-write sequence is used.
 
@@ -259,7 +269,7 @@ In addition to upload permissions and any bucket encryption/KMS permissions, gra
 
 | Operation | Permission |
 | --- | --- |
-| Check versioning for fixed-name backups | `s3:GetBucketVersioning` on the bucket; `AccessDenied` logs a warning and allows backup to continue |
+| Confirm versioning for fixed-name backups | `s3:GetBucketVersioning` on the bucket. If denied, the run uses timestamped keys by default. |
 | Restore the current object | `s3:GetObject` on backup objects |
 | Restore a specific VersionId | `s3:GetObjectVersion` on backup objects |
 | Find the latest timestamped backup | `s3:ListBucket` on the bucket |
@@ -303,7 +313,8 @@ A backup requires `POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or `POSTGRES_BACKUP
 | `SCHEDULE` | Unset | Omit to back up immediately and exit. Otherwise use a five- or six-field cron expression or a descriptor such as `@weekly`. Applies to the `run` command only; manual `backup` runs immediately. |
 | `PASSPHRASE` | Unset | Nonempty enables streaming GPG encryption. Use the same passphrase when restoring an encrypted backup. Empty selects unencrypted `.dump` files. Passed to GPG through a dedicated pipe, never as a process argument, and removed from child environments. Line breaks and NUL bytes are rejected to prevent silent truncation by GPG. |
 | `BACKUP_KEEP_DAYS` | Unset | Omit to disable retention. Otherwise an integer from `1` to `36500`, without leading zeros. Deletes only expired timestamped backups after a successful backup of that database. |
-| `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` or `fixed`. Fixed mode requires bucket versioning to be `Enabled`; version-history retention is managed by S3 lifecycle rules. |
+| `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` or `fixed`. Fixed mode checks bucket versioning before choosing the key format for the run. |
+| `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` | `false` | In fixed mode, `true` allows overwriting the fixed key even when versioning is suspended, absent or unverifiable. The previous backup may be lost. Only lowercase `true` and `false` are valid. An explicitly empty value is an error. |
 
 ### S3 destination and credentials
 
@@ -505,6 +516,8 @@ Dump connections now require the primary/standby role observed by preflight, ove
 Metadata queries now override inherited `search_path` settings with `pg_catalog, pg_temp`; custom functions, aggregates or catalog lookalikes in application schemas are no longer used for database discovery or source checks.
 
 The key layout is now `<encoded-database>.dump` for fixed mode and `<encoded-database>/<timestamp>-<generation-ID>.dump` for timestamp mode, relative to the configured prefix (with `.gpg` added for encryption). Previous `<encoded-database>/latest.dump` fixed objects and flat `<database>_<timestamp>.dump` timestamped objects are not migrated or selected by restore or retention. Retrieve those backups and their VersionIds using their original S3 keys. Timestamp-only restore arguments are no longer accepted. Timestamp-only directory keys are also excluded from automatic restore and retention. Restore requires the complete new generation name; fixed-mode `--version-id ID` is unchanged.
+
+Deployments that previously updated fixed keys on `AccessDenied` now write timestamped generations by default. To keep updating the fixed key, enable bucket versioning and grant the backup credentials `s3:GetBucketVersioning`, or set `BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true` to accept possible loss of the previous backup.
 
 ## Acknowledgements and license
 
