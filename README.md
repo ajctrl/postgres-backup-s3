@@ -376,6 +376,8 @@ The [GitHub Actions workflow](.github/workflows/build-and-push-images.yml) runs 
 
 ### GHCR
 
+Publishing builds a `<postgres-version>-<commit SHA>` tag. After testing and pushing that build, the publish job checks the current `master` head before promoting it to the major-version tag. Promotions are serialized per ref and PostgreSQL major.
+
 The workflow uses the lowercase `github.repository` value for `ghcr.io/<owner>/<repository>:<postgres-version>`. Forks therefore publish under their own repository automatically. No Docker Hub account or manually created token is required.
 
 1. On a fork, enable workflows in the repository's **Actions** tab.

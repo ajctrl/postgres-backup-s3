@@ -22,7 +22,10 @@ jobs:
           cache: true
 
       - name: Run tests with the race detector
-        run: go test -count=1 -race ./...
+        env:
+          GOFLAGS: -race
+          GORACE: atexit_sleep_ms=0
+        run: go test -count=1 ./...
 
       - name: Vet Go packages
         run: go vet ./...
@@ -68,6 +71,9 @@ jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
     needs: [test, integration]
+    concurrency:
+      group: publish-${{ github.ref }}-${{ matrix.postgres }}
+      queue: max
     permissions:
       contents: read
       packages: write
@@ -97,9 +103,9 @@ jobs:
           repository="${GITHUB_REPOSITORY,,}"
           {
             echo 'tags<<EOF'
-            printf 'ghcr.io/%s:%s\n' "$repository" "$POSTGRES_VERSION"
+            printf 'ghcr.io/%s:%s-%s\n' "$repository" "$POSTGRES_VERSION" "$GITHUB_SHA"
             if [[ "$DOCKERHUB_ENABLED" == 'true' ]]; then
-              printf 'docker.io/%s/%s:%s\n' "${DOCKERHUB_USERNAME,,}" "${repository##*/}" "$POSTGRES_VERSION"
+              printf 'docker.io/%s/%s:%s-%s\n' "${DOCKERHUB_USERNAME,,}" "${repository##*/}" "$POSTGRES_VERSION" "$GITHUB_SHA"
             fi
             echo 'EOF'
             printf 'dockerhub_enabled=%s\n' "$DOCKERHUB_ENABLED"
@@ -134,3 +140,16 @@ jobs:
           platforms: |
             linux/amd64
             linux/arm64
+
+      - name: Promote current master images
+        if: github.event_name == 'push'
+        env:
+          IMAGE_TAGS: ${{ steps.images.outputs.tags }}
+        run: |
+          set -euo pipefail
+          head=$(git ls-remote --exit-code origin refs/heads/master | cut -f1)
+          if [[ "$head" == "$GITHUB_SHA" ]]; then
+            while IFS= read -r tag; do
+              docker buildx imagetools create --tag "${tag%-$GITHUB_SHA}" "$tag"
+            done <<< "$IMAGE_TAGS"
+          fi
