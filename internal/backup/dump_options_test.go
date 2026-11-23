@@ -60,7 +60,7 @@ func TestDumpOptionsExplainRestoreSettings(t *testing.T) {
 
 func TestPartialDumpOptionsRequireExplicitPermission(t *testing.T) {
 	for _, option := range []string{
-		"--table=orders", "--table-and-children=p", "--schema=public", "--extension=hstore", "--filter=selection.txt",
+		"--inserts --on-conflict-do-nothing", "--table=orders", "--table-and-children=p", "--schema=public", "--extension=hstore", "--filter=selection.txt",
 		"--section=pre-data --section=data", "--schema-only", "--enable-row-security", "--no-blobs", "--no-large-objects",
 		"--no-unlogged-table-data", "--exclude-schema=scratch", "--exclude-table=temp", "--exclude-table-data=logs",
 		"--exclude-table-and-children=p", "--exclude-table-data-and-children=p", "--exclude-extension=hstore",

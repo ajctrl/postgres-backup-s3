@@ -11,7 +11,7 @@ func TestMissingServerDateKeepsBackupAndReportsRetentionFailure(t *testing.T) {
 			f := newFixture(t)
 			f.env["POSTGRES_DATABASE"], f.env["BACKUP_KEEP_DAYS"] = "app", "7"
 			f.s3.listDate = &date
-			f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
+			f.s3.objects = []object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
 			out := f.run(false, "backup")
 			if !strings.Contains(out, "1 succeeded, 0 failed, 1 retention cleanups failed") || !strings.Contains(out, "no valid server Date") {
 				t.Fatalf("incorrect retention status: %s", out)
@@ -38,5 +38,5 @@ func TestSourceCheckFailureStopsOnlyAffectedDatabase(t *testing.T) {
 	assertEqual(t, len(f.s3.calls("PUT")), 1)
 	lists := f.s3.calls("list")
 	assertEqual(t, len(lists), 1)
-	assertEqual(t, lists[0].Query.Get("prefix"), "backup/billing/")
+	assertEqual(t, lists[0].Query.Get("prefix"), "backup/v2/full/billing/")
 }

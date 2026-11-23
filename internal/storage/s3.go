@@ -3,12 +3,17 @@ package storage
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,6 +24,7 @@ import (
 	transfertypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -37,9 +43,10 @@ type Listing struct {
 type Store interface {
 	VersioningEnabled(context.Context) (bool, error)
 	Upload(ctx context.Context, key string, body io.ReadCloser, options UploadOptions) error
-	Download(ctx context.Context, key, versionID, path string) error
-	List(ctx context.Context, prefix string) (Listing, error)
-	Delete(ctx context.Context, key string, beforeDelete func() error) error
+	Modified(ctx context.Context, key string) (time.Time, bool, error)
+	DownloadTo(ctx context.Context, key, versionID string, file *os.File) error
+	ListPages(ctx context.Context, prefix string, visit func(Listing) error) error
+	DeleteBatch(ctx context.Context, keys []string, beforeDelete func() error) error
 }
 
 type Config struct {
@@ -61,9 +68,7 @@ type S3 struct {
 
 var _ Store = (*S3)(nil)
 
-// New preserves the SDK credential chain (environment, profiles, web identity,
-// container and instance roles). Explicit credentials and the legacy S3 aliases
-// override their respective AWS environment values without mutating the process.
+// New uses a complete explicit S3 credential set or the SDK credential chain.
 func New(ctx context.Context, cfg Config) (*S3, error) {
 	return newS3(ctx, cfg, 60*time.Second)
 }
@@ -91,15 +96,13 @@ func newS3(ctx context.Context, cfg Config, idleTimeout time.Duration) (*S3, err
 	if cfg.Region != "" {
 		options = append(options, config.WithRegion(cfg.Region))
 	}
-	accessKey := firstNonempty(cfg.AccessKeyID, os.Getenv("S3_ACCESS_KEY_ID"))
-	secretKey := firstNonempty(cfg.SecretAccessKey, os.Getenv("S3_SECRET_ACCESS_KEY"))
-	token := firstNonempty(cfg.SessionToken, os.Getenv("S3_SESSION_TOKEN"))
+	accessKey, secretKey, token := cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken
+	if accessKey == "" && secretKey == "" && token == "" {
+		accessKey, secretKey, token = os.Getenv("S3_ACCESS_KEY_ID"), os.Getenv("S3_SECRET_ACCESS_KEY"), os.Getenv("S3_SESSION_TOKEN")
+	}
 	if accessKey != "" || secretKey != "" || token != "" {
-		accessKey = firstNonempty(accessKey, os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_ACCESS_KEY"))
-		secretKey = firstNonempty(secretKey, os.Getenv("AWS_SECRET_ACCESS_KEY"), os.Getenv("AWS_SECRET_KEY"))
-		token = firstNonempty(token, os.Getenv("AWS_SESSION_TOKEN"))
 		if accessKey == "" || secretKey == "" {
-			return nil, fmt.Errorf("S3 credential overrides require both an access key ID and secret access key (S3_* or AWS_* variables)")
+			return nil, fmt.Errorf("S3 credential overrides require both an access key ID and secret access key (S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)")
 		}
 		options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))
 	}
@@ -138,6 +141,22 @@ func (s *S3) VersioningEnabled(ctx context.Context) (bool, error) {
 	return out.Status == types.BucketVersioningStatusEnabled, nil
 }
 
+// Modified distinguishes a missing fixed backup from permission and transport errors.
+func (s *S3) Modified(ctx context.Context, key string) (time.Time, bool, error) {
+	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		var res *smithyhttp.ResponseError
+		if errors.As(err, &res) && res.HTTPStatusCode() == http.StatusNotFound {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, fmt.Errorf("inspect fixed backup: %w", err)
+	}
+	if out.LastModified == nil || out.LastModified.IsZero() {
+		return time.Time{}, false, fmt.Errorf("fixed backup has no LastModified")
+	}
+	return *out.LastModified, true, nil
+}
+
 func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -148,31 +167,73 @@ func (s *S3) Download(ctx context.Context, key, versionID, path string) error {
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
-	input := &transfermanager.DownloadObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), WriterAt: f,
-	}
-	if versionID != "" {
-		input.VersionID = aws.String(versionID)
-	}
-	if _, err := s.transfer.DownloadObject(ctx, input); err != nil {
-		return fmt.Errorf("download S3 object %q: %w", key, err)
-	}
-	if err := ctx.Err(); err != nil {
+	if err := s.DownloadTo(ctx, key, versionID, f); err != nil {
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close download file: %w", err)
 	}
-	// Never expose an incomplete download to pg_restore, including on retries.
 	if err := os.Rename(f.Name(), path); err != nil {
 		return fmt.Errorf("finish download file: %w", err)
 	}
 	return nil
 }
 
-func (s *S3) List(ctx context.Context, prefix string) (Listing, error) {
+// DownloadTo writes to a caller-owned scratch file. Consume it only on success.
+func (s *S3) DownloadTo(ctx context.Context, key, versionID string, f *os.File) error {
+	return s.downloadTo(ctx, key, versionID, f, true)
+}
+
+func (s *S3) downloadTo(ctx context.Context, key, versionID string, f *os.File, resolveReference bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	input := &transfermanager.DownloadObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), WriterAt: f,
+	}
+	if versionID != "" {
+		input.VersionID = aws.String(versionID)
+	}
+	if versionID == "null" {
+		head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: input.Bucket, Key: input.Key, VersionId: input.VersionID})
+		if err != nil {
+			return fmt.Errorf("inspect mutable null version: %w", err)
+		}
+		if aws.ToString(head.ETag) == "" {
+			return fmt.Errorf("mutable null version has no ETag")
+		}
+		input.IfMatch = head.ETag
+	}
+	if _, err := s.transfer.DownloadObject(ctx, input); err != nil {
+		return fmt.Errorf("download S3 object %q: %w", key, err)
+	}
+	if resolveReference {
+		var ref [len(referencePrefix) + 32]byte
+		n, err := f.ReadAt(ref[:], 0)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if strings.HasPrefix(string(ref[:n]), referencePrefix) {
+			info, err := f.Stat()
+			if err != nil {
+				return err
+			}
+			id := string(ref[len(referencePrefix):n])
+			if _, err := hex.DecodeString(id); err != nil || info.Size() != int64(len(ref)) || strings.ToLower(id) != id {
+				return fmt.Errorf("invalid fixed backup reference at %q", key)
+			}
+			return s.downloadTo(ctx, key+".generations/"+id, "", f, false)
+		}
+	}
+	return ctx.Err()
+}
+
+func (s *S3) ListPages(ctx context.Context, prefix string, visit func(Listing) error) error {
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
+		Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl,
 	})
 	var listing Listing
 	firstPage := true
@@ -180,7 +241,7 @@ func (s *S3) List(ctx context.Context, prefix string) (Listing, error) {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return Listing{}, fmt.Errorf("list S3 objects: %w", err)
+			return fmt.Errorf("list S3 objects: %w", err)
 		}
 		if firstPage {
 			if response, ok := awsmiddleware.GetRawResponse(page.ResultMetadata).(*smithyhttp.Response); ok && response != nil && response.Response != nil {
@@ -188,22 +249,84 @@ func (s *S3) List(ctx context.Context, prefix string) (Listing, error) {
 			}
 			firstPage = false
 		}
+		listing.Objects = nil
 		for _, object := range page.Contents {
 			// Missing dates must not turn an unknown age into an expired backup.
 			if object.Key == nil || object.LastModified == nil {
-				return Listing{}, fmt.Errorf("S3 list response contains an object without a key or modification time")
+				return fmt.Errorf("S3 list response contains an object without a key or modification time")
 			}
-			listing.Objects = append(listing.Objects, Object{Key: *object.Key, LastModified: *object.LastModified})
+			key := *object.Key
+			if page.EncodingType == types.EncodingTypeUrl {
+				key, err = url.PathUnescape(key)
+				if err != nil {
+					return fmt.Errorf("invalid URL-encoded S3 key: %w", err)
+				}
+			}
+			listing.Objects = append(listing.Objects, Object{Key: key, LastModified: *object.LastModified})
+		}
+		if !aws.ToBool(page.IsTruncated) && page.NextContinuationToken != nil {
+			return fmt.Errorf("S3 list response supplies a continuation token without IsTruncated=true")
 		}
 		if aws.ToBool(page.IsTruncated) {
 			token := aws.ToString(page.NextContinuationToken)
 			if token == "" || tokens[token] {
-				return Listing{}, fmt.Errorf("S3 list response contains an invalid continuation token")
+				return fmt.Errorf("S3 list response contains an invalid continuation token")
 			}
 			tokens[token] = true
 		}
+		if err := visit(listing); err != nil {
+			return err
+		}
 	}
-	return listing, nil
+	return nil
+}
+
+func (s *S3) DeleteBatch(ctx context.Context, keys []string, guard func() error) error {
+	if len(keys) == 1 {
+		return s.Delete(ctx, keys[0], guard)
+	}
+	objects := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		// XML 1.0 cannot represent every S3 key. Keep these keys in the URL
+		// of a single-object request so serialization cannot change the key.
+		if strings.ContainsFunc(key, func(r rune) bool {
+			return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0xfffe || r == 0xffff
+		}) {
+			if err := s.Delete(ctx, key, guard); err != nil {
+				return err
+			}
+			continue
+		}
+		objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+	}
+	if len(objects) == 0 {
+		return nil
+	}
+	out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: aws.String(s.bucket),
+		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)}}, withAttemptGuard(guard), func(o *s3.Options) { o.APIOptions = append(o.APIOptions, deleteContentMD5) })
+	if err != nil {
+		return fmt.Errorf("delete expired backups: %w", err)
+	}
+	if len(out.Errors) > 0 {
+		return fmt.Errorf("failed to delete %d expired backups; first key %q: %s", len(out.Errors), aws.ToString(out.Errors[0].Key), aws.ToString(out.Errors[0].Code))
+	}
+	return nil
+}
+
+// Hash the SDK-serialized XML, including its namespace and escaped key names.
+func deleteContentMD5(stack *middleware.Stack) error {
+	return stack.Build.Add(middleware.BuildMiddlewareFunc("DeleteContentMD5", func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+		req := in.Request.(*smithyhttp.Request)
+		digest := md5.New()
+		if _, err := io.Copy(digest, req.GetStream()); err != nil {
+			return middleware.BuildOutput{}, middleware.Metadata{}, err
+		}
+		if err := req.RewindStream(); err != nil {
+			return middleware.BuildOutput{}, middleware.Metadata{}, err
+		}
+		req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(digest.Sum(nil)))
+		return next.HandleBuild(ctx, in)
+	}), middleware.After)
 }
 
 func (s *S3) Delete(ctx context.Context, key string, beforeDelete func() error) error {
@@ -214,13 +337,4 @@ func (s *S3) Delete(ctx context.Context, key string, beforeDelete func() error) 
 		return fmt.Errorf("delete S3 object %q: %w", key, err)
 	}
 	return nil
-}
-
-func firstNonempty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }

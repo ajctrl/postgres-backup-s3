@@ -193,6 +193,8 @@ func TestS3RejectsIncompleteListings(t *testing.T) {
 		{"missing date", "<Contents><Key>old.dump</Key></Contents>"},
 		{"missing key", "<Contents><LastModified>2026-09-12T11:20:30Z</LastModified></Contents>"},
 		{"missing token", "<IsTruncated>true</IsTruncated>"},
+		{"missing truncation flag", "<NextContinuationToken>again</NextContinuationToken>"},
+		{"unexpected token", "<IsTruncated>false</IsTruncated><NextContinuationToken>again</NextContinuationToken>"},
 		{"repeated token", "<IsTruncated>true</IsTruncated><NextContinuationToken>again</NextContinuationToken>"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -335,10 +337,22 @@ func TestS3FailedDownloadKeepsDestination(t *testing.T) {
 
 func TestS3MultipartDownloadPinsObject(t *testing.T) {
 	payload := bytes.Repeat([]byte("restored-part-"), 1400000)
-	for _, versionID := range []string{"", "old+version/=id"} {
+	for _, versionID := range []string{"", "null", "old+version/=id"} {
 		t.Run("version="+versionID, func(t *testing.T) {
 			var requests atomic.Int32
 			s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+				if versionID == "null" {
+					if r.URL.Query().Get("versionId") != "null" {
+						t.Error("missing null version")
+					}
+					if r.Method == http.MethodHead {
+						w.Header().Set("ETag", `"same-object"`)
+						return
+					}
+					if r.Header.Get("If-Match") != `"same-object"` {
+						t.Error("mutable version must be pinned for every range")
+					}
+				}
 				requests.Add(1)
 				var start, end int
 				if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start >= len(payload) {
@@ -383,10 +397,10 @@ func TestS3CredentialOverridesAndDefaultChain(t *testing.T) {
 		wantToken  string
 	}{
 		{"AWS environment", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "AWS_SESSION_TOKEN": "aws-token"}, false, "aws-key", "aws-secret", "aws-token"},
-		{"S3 key only", Config{}, map[string]string{"S3_ACCESS_KEY_ID": "s3-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "AWS_SESSION_TOKEN": "aws-token"}, false, "s3-key", "aws-secret", "aws-token"},
-		{"S3 secret only", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "S3_SECRET_ACCESS_KEY": "s3-secret"}, false, "aws-key", "s3-secret", ""},
-		{"explicit key only", Config{AccessKeyID: "explicit-key"}, map[string]string{"AWS_SECRET_ACCESS_KEY": "aws-secret", "AWS_SESSION_TOKEN": "aws-token"}, false, "explicit-key", "aws-secret", "aws-token"},
-		{"S3 token", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "aws-key", "AWS_SECRET_ACCESS_KEY": "aws-secret", "S3_SESSION_TOKEN": "s3-token"}, false, "aws-key", "aws-secret", "s3-token"},
+		{"complete S3 credentials ignore AWS session", Config{AccessKeyID: "s3-key", SecretAccessKey: "s3-secret"}, map[string]string{"AWS_SESSION_TOKEN": "other"}, false, "s3-key", "s3-secret", ""},
+		{"S3 key only", Config{}, map[string]string{"S3_ACCESS_KEY_ID": "s3-key", "AWS_SECRET_ACCESS_KEY": "other"}, false, "", "", ""},
+		{"S3 secret only", Config{}, map[string]string{"AWS_ACCESS_KEY_ID": "other", "S3_SECRET_ACCESS_KEY": "s3-secret"}, false, "", "", ""},
+		{"S3 token only", Config{}, map[string]string{"S3_SESSION_TOKEN": "s3-token", "AWS_ACCESS_KEY_ID": "other", "AWS_SECRET_ACCESS_KEY": "other"}, false, "", "", ""},
 		{"shared profile", Config{}, nil, true, "profile-key", "profile-secret", "profile-token"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -405,6 +419,12 @@ func TestS3CredentialOverridesAndDefaultChain(t *testing.T) {
 			cfg := test.config
 			cfg.Bucket = "test-bucket"
 			s, err := New(context.Background(), cfg)
+			if test.wantKey == "" {
+				if err == nil {
+					t.Fatal("accepted incomplete S3 credentials")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -477,4 +497,30 @@ func openUpload(t *testing.T, path string) *os.File {
 	}
 	t.Cleanup(func() { f.Close() })
 	return f
+}
+
+func (s *S3) List(ctx context.Context, prefix string) (Listing, error) {
+	var listing Listing
+	err := s.ListPages(ctx, prefix, func(page Listing) error {
+		listing.ServerTime = page.ServerTime
+		listing.Objects = append(listing.Objects, page.Objects...)
+		return nil
+	})
+	if err != nil {
+		return Listing{}, err
+	}
+	return listing, nil
+}
+
+func TestListDecodesKeyOnce(t *testing.T) {
+	s := testS3(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("encoding-type") != "url" {
+			t.Error("missing URL encoding request")
+		}
+		writeXML(w, "<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>backup%2Fa%252Fb%2Bc+%01</Key><LastModified>2026-01-01T00:00:00Z</LastModified></Contents></ListBucketResult>")
+	})
+	out, err := s.List(t.Context(), "backup/")
+	if err != nil || len(out.Objects) != 1 || out.Objects[0].Key != "backup/a%2Fb+c+\x01" {
+		t.Fatalf("unexpected list: %v %v", out, err)
+	}
 }

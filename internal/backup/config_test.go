@@ -11,7 +11,11 @@ import (
 func TestConfigDefaultsAndValidation(t *testing.T) {
 	base := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db"}
 	load := func(extra map[string]string) (Config, error) {
-		return loadConfig(func(key string) (string, bool) {
+		command := "backup"
+		if _, ok := extra["RESTORE_TIMEOUT"]; ok {
+			command = "restore"
+		}
+		return loadConfig(command, func(key string) (string, bool) {
 			if value, ok := extra[key]; ok {
 				return value, true
 			}
@@ -39,9 +43,30 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil || c.DatabaseTimeout != 90*time.Minute {
 		t.Fatalf("database timeout: %s, %v", c.DatabaseTimeout, err)
 	}
+	if _, err := load(map[string]string{"S3_UPLOAD_PART_SIZE_MB": "5120", "S3_UPLOAD_BUFFER_BUDGET_MB": "30720"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err = load(map[string]string{"RESTORE_TIMEOUT": "30m"})
+	if err != nil || c.RestoreTimeout != 30*time.Minute {
+		t.Fatalf("restore timeout: %v %v", c.RestoreTimeout, err)
+	}
 	for _, value := range []string{"0", "-1s", "60", "invalid"} {
+		if _, err := load(map[string]string{"RESTORE_TIMEOUT": value}); err == nil {
+			t.Errorf("accepted invalid restore timeout %q", value)
+		}
 		if _, err := load(map[string]string{"BACKUP_DATABASE_TIMEOUT": value}); err == nil {
 			t.Errorf("accepted invalid database timeout %q", value)
+		}
+	}
+}
+
+func TestCommandSpecificSettings(t *testing.T) {
+	for _, tc := range []struct{ cmd, key string }{
+		{"backup", "RESTORE_TIMEOUT"}, {"run", "RESTORE_NO_OWNER"}, {"restore", "S3_UPLOAD_PART_SIZE_MB"}, {"restore", "BACKUP_ALLOW_PARTIAL"}, {"restore", "BACKUP_DATABASE_TIMEOUT"}, {"restore", "BACKUP_ALLOW_UNVERSIONED_OVERWRITE"},
+	} {
+		env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "host", tc.key: "invalid"}
+		if _, err := loadConfig(tc.cmd, func(k string) (string, bool) { v, ok := env[k]; return v, ok }); err != nil {
+			t.Errorf("%s considered %s: %v", tc.cmd, tc.key, err)
 		}
 	}
 }
@@ -51,14 +76,14 @@ func TestSelectionAndRetentionValidation(t *testing.T) {
 	for _, days := range []string{"", "1", "7", "36500"} {
 		c := valid
 		c.KeepDays = days
-		if _, err := c.validateBackup(); err != nil {
+		if _, _, err := c.validateBackup(); err != nil {
 			t.Errorf("valid retention %q: %v", days, err)
 		}
 	}
 	for _, days := range []string{"0", "01", "-1", "1.0", "+1", " 1", "1\n", "abc", "36501", "999999999999999999999", "１２"} {
 		c := valid
 		c.KeepDays = days
-		if _, err := c.validateBackup(); err == nil {
+		if _, _, err := c.validateBackup(); err == nil {
 			t.Errorf("accepted invalid retention %q", days)
 		}
 	}
@@ -66,7 +91,7 @@ func TestSelectionAndRetentionValidation(t *testing.T) {
 		{BackupAll: "false"}, {BackupAll: "True"}, {Database: "app", BackupAll: "true"},
 		{Databases: "app,billing", BackupAll: "true"}, {Database: "app", BackupAll: "false", Exclude: "scratch"},
 	} {
-		if _, err := c.validateBackup(); err == nil {
+		if _, _, err := c.validateBackup(); err == nil {
 			t.Errorf("accepted invalid selection %#v", c)
 		}
 	}
@@ -94,7 +119,7 @@ func TestNamesAndKeys(t *testing.T) {
 					suffix += ".gpg"
 				}
 				got, err := c.backupKey(name, date)
-				if err != nil || !strings.HasPrefix(got, tc.timestampPrefix+component+"/2026-09-12T10:30:00-") || !strings.HasSuffix(got, suffix) || !c.isTimestampBackup(name, got) {
+				if err != nil || !strings.HasPrefix(got, tc.timestampPrefix+"v2/full/"+component+"/2026-09-12T10:30:00-") || !strings.HasSuffix(got, suffix) || !c.isTimestampBackup(name, got) {
 					t.Errorf("generation key %q/%q: %q, %v", tc.prefix, name, got, err)
 				}
 				second, err := c.backupKey(name, date)
@@ -102,7 +127,7 @@ func TestNamesAndKeys(t *testing.T) {
 					t.Fatalf("same timestamp reused a generation: %q, %v", second, err)
 				}
 				c.FilenameMode = "fixed"
-				if got, err := c.backupKey(name, date); err != nil || got != tc.fixedPrefix+component+suffix {
+				if got, err := c.backupKey(name, date); err != nil || got != tc.fixedPrefix+"v2/full/"+component+suffix {
 					t.Errorf("fixed key %q/%q: %q, %v", tc.prefix, name, got, err)
 				}
 			}
@@ -129,6 +154,17 @@ func TestScheduleCompatibility(t *testing.T) {
 	}
 }
 
+func TestIncompleteScheduleTimezoneIsRejected(t *testing.T) {
+	for _, spec := range []string{"TZ=", "TZ=Asia/Tokyo", "CRON_TZ=UTC ", "TZ= @daily", "@every -1s", "@every 0s", "CRON_TZ=UTC @every 500ms", "@every 1.5s"} {
+		app := New(Config{Database: "app", BackupAll: "false", Schedule: spec}, nil, nil, nil)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := app.Run(ctx); err == nil || !strings.Contains(err.Error(), "invalid SCHEDULE") {
+			t.Fatalf("schedule %q: %v", spec, err)
+		}
+	}
+}
+
 func TestInvalidSelectionFailsBeforeScheduling(t *testing.T) {
 	for _, c := range []Config{
 		{BackupAll: "false", Databases: "app,,billing"},
@@ -150,8 +186,8 @@ func TestUploadPartSizeConfiguration(t *testing.T) {
 	for _, value := range []string{"", "5", "8", "64", "5120", "4", "5121", "-1", "1.5", "huge"} {
 		t.Run(value, func(t *testing.T) {
 			env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db", "S3_UPLOAD_PART_SIZE_MB": value}
-			c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
-			valid := value == "" || value == "5" || value == "8" || value == "64" || value == "5120"
+			c, err := loadConfig("backup", func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+			valid := value == "" || value == "5" || value == "8" || value == "64"
 			if (err == nil) != valid {
 				t.Fatalf("part size %q: %v", value, err)
 			}
@@ -167,7 +203,7 @@ func TestRestoreOptionConfiguration(t *testing.T) {
 		for _, value := range []string{"", "false", "true", "TRUE", "1", "no", " true"} {
 			t.Run(name+"="+value, func(t *testing.T) {
 				env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db", name: value}
-				c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+				c, err := loadConfig("restore", func(key string) (string, bool) { v, ok := env[key]; return v, ok })
 				valid := value == "" || value == "false" || value == "true"
 				if (err == nil) != valid || !valid && !strings.Contains(err.Error(), name) {
 					t.Fatalf("%s=%q: error=%v", name, value, err)
@@ -191,7 +227,7 @@ func TestRestoreOptionConfiguration(t *testing.T) {
 func TestPartialBackupConfigurationAndDatabaseSelection(t *testing.T) {
 	for _, value := range []string{"", "false", "true", "TRUE", "1", "no"} {
 		env := map[string]string{"S3_BUCKET": "bucket", "POSTGRES_USER": "user", "POSTGRES_PASSWORD": "secret", "POSTGRES_HOST": "db", "BACKUP_ALLOW_PARTIAL": value}
-		c, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+		c, err := loadConfig("backup", func(key string) (string, bool) { v, ok := env[key]; return v, ok })
 		valid := value == "" || value == "false" || value == "true"
 		if (err == nil) != valid || valid && c.AllowPartial != (value == "true") {
 			t.Fatalf("BACKUP_ALLOW_PARTIAL=%q: %#v, %v", value, c, err)
@@ -201,15 +237,15 @@ func TestPartialBackupConfigurationAndDatabaseSelection(t *testing.T) {
 		{Database: "app", BackupAll: "false"}, {Databases: "app,billing", BackupAll: "false"},
 		{BackupAll: "true", Exclude: "scratch"},
 	} {
-		if _, err := c.validateBackup(); err != nil {
+		if _, _, err := c.validateBackup(); err != nil {
 			t.Errorf("database selection incorrectly requires partial permission: %v", err)
 		}
 		c.DumpOptions = "--table=orders"
-		if _, err := c.validateBackup(); err == nil {
+		if _, _, err := c.validateBackup(); err == nil {
 			t.Fatal("table selection accepted without partial permission")
 		}
 		c.AllowPartial = true
-		if _, err := c.validateBackup(); err != nil {
+		if _, _, err := c.validateBackup(); err != nil {
 			t.Errorf("explicit partial permission rejected: %v", err)
 		}
 	}

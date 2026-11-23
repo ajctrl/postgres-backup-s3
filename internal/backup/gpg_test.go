@@ -45,13 +45,17 @@ func TestRealGPGPassphrasePipeRoundTrip(t *testing.T) {
 		pipelineCommand{name: gpg, passphrase: secret, args: append(append([]string{}, common...), "--symmetric", "--output", "-")}); err != nil {
 		t.Fatalf("encrypt: %v\n%s", err, &stderr)
 	}
-	path := filepath.Join(home, "test.gpg")
-	if err := os.WriteFile(path, encrypted.Bytes(), 0600); err != nil {
+	ciphertext, err := anonymousDump(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ciphertext.Close()
+	if _, err := ciphertext.WriteAt(encrypted.Bytes(), 0); err != nil {
 		t.Fatal(err)
 	}
 	var plain bytes.Buffer
-	if err := runner.pipeline(ctx, &plain, pipelineCommand{name: gpg, passphrase: secret,
-		args: append(append([]string{}, common...), "--decrypt", path)}); err != nil {
+	if err := runner.pipeline(ctx, &plain, pipelineCommand{name: gpg, stdin: ciphertext, passphrase: secret,
+		args: append(append([]string{}, common...), "--decrypt", "/dev/stdin")}); err != nil {
 		t.Fatalf("decrypt: %v\n%s", err, &stderr)
 	}
 	if !bytes.Equal(plain.Bytes(), archive) {

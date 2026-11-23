@@ -15,7 +15,7 @@ func TestUnsafeDumpOptionsNeverStartBackup(t *testing.T) {
 		"--no-tablespaces", "--no-table-access-method", "--clean", "--create", "--if-exists",
 		"--disable-triggers", "--use-set-session-authorization", "-vc", "-vC",
 		"--filter=-", "--filter -", "--no-synchronized-snapshots",
-		"--table=orders", "--schema-only", "--enable-row-security", "--no-acl",
+		"--inserts --on-conflict-do-nothing", "--table=orders", "--schema-only", "--no-toast-compression", "--enable-row-security", "--no-acl",
 	} {
 		t.Run(option, func(t *testing.T) {
 			f := newFixture(t)
@@ -36,6 +36,7 @@ func TestPartialBackupPermissionAndVersionGate(t *testing.T) {
 		options, partial, version string
 		success                   bool
 	}{
+		{"--inserts --on-conflict-do-nothing", "true", "17.11", true},
 		{"--table=orders", "true", "18.0", true},
 		{"--schema-only", "true", "17.11", true},
 		{"--filter=-", "true", "18.0", false},
@@ -59,6 +60,8 @@ func TestPartialBackupPermissionAndVersionGate(t *testing.T) {
 				}
 			} else if tc.partial == "true" && !strings.Contains(output, "partial database backup explicitly enabled") {
 				t.Fatal("missing partial-backup warning")
+			} else if strings.Contains(tc.options, "--on-conflict-do-nothing") && !strings.Contains(output, "conflicting rows will be skipped") {
+				t.Fatal("missing conflict warning")
 			}
 		})
 	}
@@ -97,7 +100,7 @@ func TestEmptyBackupSkipsUploadAndRetention(t *testing.T) {
 				f.env["POSTGRES_DATABASE"], f.env["BACKUP_KEEP_DAYS"] = "app", "7"
 				f.env["BACKUP_FILENAME_MODE"], f.env["BACKUP_ALLOW_UNVERSIONED_OVERWRITE"] = tc.mode, tc.allow
 				f.s3.versioning = tc.versioning
-				f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
+				f.s3.objects = []object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
 				script := "#!/bin/sh\nexit 0\n"
 				wantError := "custom-format archive"
 				if tool == "gpg" {

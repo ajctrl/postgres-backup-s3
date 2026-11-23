@@ -52,7 +52,7 @@ func TestBackupClockRollbackStopsPublicationAndRetention(t *testing.T) {
 				started := time.Now()
 				current := started
 				store := &publishingStore{}
-				store.objects = []storage.Object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: started.Add(-30 * 24 * time.Hour)}}
+				store.objects = []storage.Object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: started.Add(-30 * 24 * time.Hour)}}
 				rollback := func() { current = started.Add(-time.Nanosecond) }
 				if phase == "before publication" {
 					store.before = rollback
@@ -92,7 +92,14 @@ func writeFakeDump(t *testing.T, dir string, archive []byte) {
 	if err := os.WriteFile(filepath.Join(dir, "archive.dump"), archive, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pg_dump"), []byte("#!/bin/sh\ncat \"${0%/*}/archive.dump\"\n"), 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "billing.dump"), bytes.Replace(archive, append(archiveInt(3, 4), []byte("app")...), append(archiveInt(7, 4), []byte("billing")...), 1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pg_dump"), []byte(`#!/bin/sh
+file=archive.dump
+for arg do case "$arg" in postgresql:///billing\?*) file=billing.dump;; esac; done
+cat "${0%/*}/$file"
+`), 0700); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -118,7 +125,7 @@ func TestAmbiguousBackupNeverPublishesOrRunsRetention(t *testing.T) {
 
 func TestRetentionClockRollbackAfterListingPreventsDeletion(t *testing.T) {
 	started := time.Now()
-	s := &recordingStore{objects: []storage.Object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: started.Add(-48 * time.Hour)}}}
+	s := &recordingStore{objects: []storage.Object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: started.Add(-48 * time.Hour)}}}
 	a := New(Config{Prefix: "backup"}, s, io.Discard, io.Discard)
 	checks := 0
 	err := a.removeOldBackups(t.Context(), "app", "new-key", 1, func() error {
@@ -135,7 +142,43 @@ func TestRetentionClockRollbackAfterListingPreventsDeletion(t *testing.T) {
 
 func TestLegacyTimestampKeyExcluded(t *testing.T) {
 	c := Config{Prefix: "backup"}
-	if c.isTimestampBackup("app", "backup/app/2000-01-01T00:00:00.dump") {
+	if c.isTimestampBackup("app", "backup/v2/full/app/2000-01-01T00:00:00.dump") {
 		t.Fatal("legacy timestamp-only key was selected")
+	}
+}
+
+type deadlineStore struct {
+	publishingStore
+	versioningTimedOut, retentionTimedOut bool
+}
+
+func (s *deadlineStore) VersioningEnabled(ctx context.Context) (bool, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return false, errors.New("missing versioning deadline")
+	}
+	<-ctx.Done()
+	s.versioningTimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	return false, ctx.Err()
+}
+
+func (s *deadlineStore) ListPages(ctx context.Context, _ string, _ func(storage.Listing) error) error {
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("missing retention deadline")
+	}
+	<-ctx.Done()
+	s.retentionTimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	return ctx.Err()
+}
+
+func TestVersioningAndRetentionHaveSeparateDeadlines(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeDump(t, dir, customArchiveFixture(16, tocFixture{kind: "DATABASE", section: 2, definition: "CREATE DATABASE app"}))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	s := &deadlineStore{}
+	app := New(Config{Database: "app", BackupAll: "false", FilenameMode: "fixed", KeepDays: "7", DatabaseTimeout: 250 * time.Millisecond}, s, io.Discard, io.Discard)
+	app.lockPath = filepath.Join(dir, "backup.lock")
+	err := app.Backup(t.Context())
+	if err == nil || !s.versioningTimedOut || !s.retentionTimedOut || s.published != 1 || !s.ifAbsent {
+		t.Fatalf("expected timestamp fallback and bounded cleanup: published=%d versionTimeout=%v retentionTimeout=%v err=%v", s.published, s.versioningTimedOut, s.retentionTimedOut, err)
 	}
 }

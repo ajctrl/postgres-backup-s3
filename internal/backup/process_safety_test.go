@@ -13,6 +13,51 @@ import (
 	"time"
 )
 
+func TestChildCredentials(t *testing.T) {
+	for _, key := range []string{"POSTGRES_PASSWORD", "S3_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN", "PGPASSWORD", "PASSPHRASE", "PGPASSFILE"} {
+		t.Setenv(key, "fixture")
+	}
+	for _, name := range []string{"gpg", "psql", "pg_dump", "pg_restore"} {
+		cmd := (commandRunner{password: "selected"}).command(t.Context(), name)
+		values := map[string]string{}
+		for _, v := range cmd.Env {
+			k, value, _ := strings.Cut(v, "=")
+			values[k] = value
+		}
+		for _, key := range []string{"POSTGRES_PASSWORD", "S3_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN", "PASSPHRASE"} {
+			if _, found := values[key]; found {
+				t.Errorf("%s inherited %s", name, key)
+			}
+		}
+		if name == "gpg" {
+			for _, key := range []string{"PGPASSWORD", "PGPASSFILE"} {
+				if _, found := values[key]; found {
+					t.Errorf("gpg inherited %s", key)
+				}
+			}
+		} else if values["PGPASSWORD"] != "selected" || values["PGPASSFILE"] != "fixture" {
+			t.Errorf("%s lost libpq configuration", name)
+		}
+	}
+}
+
+func TestPostgresTLSDefaultAndOverride(t *testing.T) {
+	for _, mode := range []string{"", "require", "disable"} {
+		t.Setenv("PGSSLMODE", mode)
+		want := mode
+		if want == "" {
+			want = "verify-full"
+		}
+		app := New(Config{}, nil, nil, nil)
+		if got := app.connectionArgs("app")[1]; got != "postgresql:///app?sslmode="+want {
+			t.Fatal(got)
+		}
+		if got := app.dumpConnectionArgs("app", false)[1]; got != "postgresql:///app?sslmode="+want+"&target_session_attrs=primary" {
+			t.Fatal(got)
+		}
+	}
+}
+
 func TestPipelineConsumerReceivesEOFBeforeProducerExits(t *testing.T) {
 	for _, exitCode := range []int{0, 1} {
 		t.Run(fmt.Sprint(exitCode), func(t *testing.T) {

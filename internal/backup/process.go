@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,10 +28,16 @@ type commandRunner struct {
 // service-file and environment defaults. SET runs after connecting so it also
 // overrides database/role settings without discarding unrelated libpq options.
 func (r commandRunner) queryJSON(ctx context.Context, value any, args ...string) error {
+	return r.readJSON(ctx, nil, value, args...)
+}
+
+func (r commandRunner) readJSON(ctx context.Context, input io.Reader, value any, args ...string) error {
 	// Quiet suppresses SET's command tag; stdout must contain only query JSON.
-	// Explicit pg_temp placement keeps temporary relations behind pg_catalog.
-	args = append([]string{"--quiet", "-c", "SET search_path = pg_catalog, pg_temp"}, args...)
+	// Apply the encoding after login as well: service files can take precedence
+	// over PGCLIENTENCODING. Explicit pg_temp placement keeps catalogs first.
+	args = append([]string{"--quiet", "-c", "SET search_path = pg_catalog, pg_temp; SET client_encoding = 'UTF8'"}, args...)
 	cmd := r.command(ctx, "psql", args...)
+	cmd.Stdin = input
 	cmd.Env = append(withoutEnv(cmd.Env, "PGCLIENTENCODING"), "PGCLIENTENCODING=UTF8")
 	var output bytes.Buffer
 	cmd.Stdout = &output
@@ -47,8 +54,20 @@ func (r commandRunner) queryJSON(ctx context.Context, value any, args ...string)
 	return nil
 }
 
-func (r commandRunner) restore(ctx context.Context, args ...string) error {
+func (r commandRunner) restore(ctx context.Context, file *os.File, args ...string) error {
+	if file != nil {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		args = append(args, "/dev/stdin")
+	}
 	cmd := r.command(ctx, "pg_restore", args...)
+	if file != nil {
+		cmd.Stdin = file
+	}
+	// Give pg_restore time to cancel the active server query; WaitDelay
+	// bounds the grace period if the client cannot finish.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	// Both SQL and server diagnostics can contain credentials and row values.
 	// Discard at the source, rather than attempting language-dependent redaction.
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
@@ -91,7 +110,20 @@ func (r commandRunner) checkDumpClient(ctx context.Context, minimum int) error {
 func (r commandRunner) command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stderr = r.stderr
-	cmd.Env = append(withoutEnv(withoutEnv(os.Environ(), "PGPASSWORD"), "PASSPHRASE"), "PGPASSWORD="+r.password)
+	tool := filepath.Base(name)
+	pgTool := tool == "psql" || tool == "pg_dump" || tool == "pg_restore"
+	cmd.Env = make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "S3_") || strings.HasPrefix(key, "AWS_") || strings.HasPrefix(key, "POSTGRES_") ||
+			key == "PASSPHRASE" || key == "PGPASSWORD" || (!pgTool && strings.HasPrefix(key, "PG")) {
+			continue
+		}
+		cmd.Env = append(cmd.Env, entry)
+	}
+	if pgTool {
+		cmd.Env = append(cmd.Env, "PGPASSWORD="+r.password)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if r.lock != nil {
 		// The child keeps the operation lock if the parent is killed abruptly.
@@ -120,12 +152,16 @@ func commandError(ctx context.Context, name string, err error) error {
 }
 
 type pipelineCommand struct {
-	name                       string
-	args                       []string
-	passphrase                 string
-	customDump                 bool
-	rejectUnlogged             bool
-	rejectMissingSubscriptions bool
+	name           string
+	args           []string
+	passphrase     string
+	customDump     bool
+	rejectUnlogged bool
+	strictDump     bool
+	metadata       *archiveMetadata
+	database       string
+	catalog        *catalogSnapshot
+	stdin          *os.File
 }
 
 type synchronizedWriter struct {
@@ -204,7 +240,10 @@ func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...
 	defer closePipes()
 	for i, spec := range specs {
 		cmds[i] = r.command(ctx, spec.name, spec.args...)
-		if spec.rejectMissingSubscriptions {
+		if spec.stdin != nil {
+			cmds[i].Stdin = spec.stdin
+		}
+		if spec.strictDump {
 			cmd := cmds[i]
 			// LC_ALL overrides LC_MESSAGES. Preserve its character encoding
 			// for libpq users who select PGCLIENTENCODING=auto.
@@ -283,11 +322,22 @@ func (r commandRunner) pipeline(ctx context.Context, stdout io.Writer, specs ...
 				// Tee the uncompressed TOC to the existing streaming pipeline. Any
 				// parser read-ahead is already forwarded, so resume from the same
 				// underlying reader without replaying or dropping buffered bytes.
-				err := checkArchive(ctx, io.TeeReader(task.reader, task.writer), specs[i].rejectUnlogged)
-				if err == nil {
-					_, err = io.Copy(task.writer, task.reader)
-				} else {
+				err := inspectArchive(ctx, io.TeeReader(task.reader, task.writer), archiveChecks{
+					rejectUnlogged: specs[i].rejectUnlogged, requireMappingOptions: specs[i].strictDump, metadata: specs[i].metadata, database: specs[i].database,
+				})
+				if err == nil && specs[i].metadata != nil {
+					err = verifyCatalog(ctx, specs[i].catalog, specs[i].metadata)
+				}
+				if specs[i].catalog != nil {
+					specs[i].catalog.close()
+				}
+				if err != nil {
 					err = fmt.Errorf("backup archive rejected before publication: %w", err)
+				} else {
+					_, err = io.Copy(task.writer, task.reader)
+					if m := specs[i].metadata; err == nil && m != nil && len(m.proofs) > 0 {
+						err = writeCatalogProof(task.writer, m.proofs)
+					}
 				}
 				task.reader.Close()
 				if task.output != nil {
@@ -326,9 +376,31 @@ func withoutEnv(environ []string, name string) []string {
 }
 
 func acquireLock(path string) (*os.File, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	if path == defaultLockPath {
+		dir := filepath.Dir(path)
+		if err := os.Mkdir(dir, 0700); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() || info.Mode().Perm()&0077 != 0 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+			return nil, fmt.Errorf("backup lock directory must be private and owned by the running user: %s", dir)
+		}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("open backup lock: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("backup lock must be a regular file")
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()

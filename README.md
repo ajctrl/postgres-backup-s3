@@ -24,8 +24,12 @@ Create a `compose.yaml` for the backup service. Replace the example connection a
 ```yaml
 services:
   backup:
+    volumes:
+      - ./postgres-ca.pem:/run/postgres-ca.pem:ro
     image: ghcr.io/ajctrl/postgres-backup-s3:18
     environment:
+      PGSSLMODE: verify-full
+      PGSSLROOTCERT: /run/postgres-ca.pem
       POSTGRES_HOST: postgres.example.com
       POSTGRES_PORT: "5432"
       POSTGRES_DATABASE: app
@@ -36,6 +40,7 @@ services:
       S3_PREFIX: backup
       S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}"
       S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}"
+      S3_SESSION_TOKEN: "${S3_SESSION_TOKEN:-}"
       SCHEDULE: "0 2 * * *"
       BACKUP_KEEP_DAYS: "7"
       BACKUP_FILENAME_MODE: "${BACKUP_FILENAME_MODE:-timestamp}"
@@ -43,7 +48,9 @@ services:
       PASSPHRASE: "${PASSPHRASE:-}"
 ```
 
-For profiles or workload IAM roles, omit the two `S3_*` credential entries and configure the [AWS credential chain](#s3-destination-and-credentials). Set `S3_ENDPOINT` for a non-AWS storage provider.
+Place the trusted PostgreSQL CA certificate in `./postgres-ca.pem` and use the hostname covered by the server certificate. TCP connections default to `PGSSLMODE=verify-full`. The application passes the selected `sslmode` in each PostgreSQL connection URI, overriding a conflicting libpq service-file setting. The repository development Compose fixture explicitly uses `disable` for its local test server.
+
+For profiles or workload IAM roles, omit the `S3_*` credential entries and configure the [AWS credential chain](#s3-destination-and-credentials). Set `S3_ENDPOINT` for a non-AWS storage provider.
 
 Start the scheduler, trigger the first backup, and inspect its logs:
 
@@ -63,9 +70,9 @@ The schedule above runs daily at 02:00 UTC by default. Scheduled containers wait
 | --- | --- |
 | `postgres-backup-s3 run` | Default container command. Uses `SCHEDULE`, or backs up once and exits when it is unset or empty. |
 | `postgres-backup-s3 backup` | Backs up immediately, regardless of `SCHEDULE`. |
-| `postgres-backup-s3 restore [generation \| --version-id ID]` | Restores one database; see [restore instructions](#restore-a-database). |
+| `postgres-backup-s3 restore [generation \| --partial generation \| --version-id ID]` | Restores one database; see [restore instructions](#restore-a-database). |
 
-`SCHEDULE` accepts five cron fields (`minute hour day-of-month month day-of-week`), six fields with leading seconds, and descriptors such as `@weekly` or `@every 1h`. For example, `0 0 2 * * *` runs daily at 02:00. Schedules use the container's local timezone, normally UTC; `CRON_TZ=Asia/Tokyo 0 0 2 * * *` selects a timezone explicitly. Backup timestamps always use UTC.
+`SCHEDULE` accepts five cron fields (`minute hour day-of-month month day-of-week`), six fields with leading seconds, and descriptors such as `@weekly` or `@every 1h`. For example, `0 0 2 * * *` runs daily at 02:00. The scheduler verifies version-specific dump options against the installed client before registering a job. Schedules use the container's local timezone, normally UTC; `CRON_TZ=Asia/Tokyo 0 0 2 * * *` selects a timezone explicitly. `@every` accepts positive whole seconds (for example `1s` or `1h30m`). Backup timestamps always use UTC.
 
 ### Select databases
 
@@ -95,17 +102,19 @@ Before dumping each database, `psql` checks whether the connection is to a stand
 
 The dump connection is restricted to the role found by the source check: `target_session_attrs=primary` or `standby` is supplied explicitly in the database URI. This overrides environment/service-file role preferences for `pg_dump`, so a multi-host connection cannot silently switch from a checked primary to a standby. If no server of the verified role is available, that database's backup fails without publication or retention. Discovery and the source check still use the configured connection preferences.
 
-Database discovery and source checks force `PGCLIENTENCODING=UTF8` and reject invalid UTF-8 before decoding JSON. This prevents non-ASCII database names from being silently changed. The override applies only to these metadata queries; `pg_dump` retains its existing encoding behavior.
+Backup and restore compare the connected database name with the requested UTF-8 name. They also check the source database recorded in the custom archive against the database selected for the S3 key. A misplaced dump fails before publication or before restore accesses the database. If PostgreSQL truncates the name, the command fails before upload or restore.
+
+Database discovery and catalog checks set the session client encoding to UTF-8 after connecting, even when a libpq service file selects another encoding. They reject invalid UTF-8 before decoding JSON. This prevents non-ASCII database names from being silently changed. The override applies only to these metadata queries; `pg_dump` retains its existing encoding behavior.
 
 These metadata connections also set `search_path` to `pg_catalog, pg_temp` after connecting and explicitly qualify built-in functions, catalog relations and types. Functions or aggregates created by other database users cannot replace the source checks or hide databases from discovery through schema search order. This overrides inherited search-path preferences only for metadata queries; other connection options, such as statement timeouts, are preserved.
 
-On PostgreSQL 17 and 18, a non-superuser dump role can read table data while omitting logical replication subscriptions. By default the backup stops before publication or retention if the actual dump reports this omission, including after a `--role` switch. Set `BACKUP_ALLOW_PARTIAL=true` to accept the omission. The strict check runs `pg_dump` with C-locale, uncolored diagnostics.
+On PostgreSQL 17 and 18, a non-superuser dump role can read table data while omitting logical replication subscriptions. By default the backup stops before publication or retention if the actual dump reports this omission, including after a `--role` switch. Set `BACKUP_ALLOW_PARTIAL=true` to accept the omission. When an FDW user mapping has no options in the archive, a strict backup verifies that the source mapping is genuinely empty. The catalog query returns only a boolean. An ambiguous match, hidden options or insufficient visibility prevents publication. The strict check runs `pg_dump` with C-locale, uncolored diagnostics.
 
 By default, `pg_dump` waits up to five minutes to acquire its initial table locks. Override this with, for example, `PGDUMP_EXTRA_OPTS=--lock-wait-timeout=30s`. For backups that take longer than 24 hours, increase `BACKUP_DATABASE_TIMEOUT` to cover the expected dump and upload time.
 
 These are independent database snapshots, not one consistent snapshot across databases. Roles and tablespaces are not included; `pg_dumpall --globals-only` is outside this tool's scope.
 
-A container-wide lock at `/tmp/postgres-backup-s3.lock` covers discovery, dump, encryption, upload and retention, and is shared with restore. Overlapping backups or restores fail before accessing PostgreSQL or S3; they do not queue. Processes release the lock when they exit. Do not delete the lock file while either operation is running. Separate containers require a shared lock filesystem or external coordination; use one backup writer per S3 destination.
+A container-wide lock at `/tmp/postgres-backup-s3-lock/operation.lock` covers discovery, dump, encryption, upload and retention, and is shared with restore. Overlapping backups or restores fail before accessing PostgreSQL or S3; they do not queue. Processes release the lock when they exit. Do not delete the lock file while either operation is running. The lock directory must be owned by the runtime user with mode `0700`. Share that directory between containers using the same lock. Separate containers require a shared lock filesystem or external coordination; use one backup writer per S3 destination.
 
 ## Restore a database
 
@@ -122,29 +131,41 @@ Choose one existing target database using `POSTGRES_DATABASE`, even if the conta
 docker compose exec -e POSTGRES_DATABASE=app backup postgres-backup-s3 restore
 ```
 
-Timestamp mode selects the matching generation with the newest S3 `LastModified` for that exact database and encryption format, across all listing pages. Equal modification times are resolved by lexicographical generation name; random IDs do not establish creation order within a tied timestamp. Fixed mode downloads the current object directly.
+Timestamp mode selects the matching generation with the newest S3 `LastModified` for that exact database and encryption format, across all listing pages. Equal modification times are resolved by lexicographical generation name; random IDs do not establish creation order within a tied timestamp. In fixed mode, an argument-free restore compares the current fixed object with timestamped full backups for the same database and encryption format. It restores the newest candidate. If multiple candidates tie for newest, specify a generation or fixed VersionId. Comparisons against the fixed object use the whole-second precision of its HTTP modification date.
 
 ### Specific generation
 
-Specify the full generation name (`UTC timestamp` + `-` + 32 lowercase hexadecimal characters), without `.dump` or `.dump.gpg`. The name appears in the backup completion log and S3 key. This argument is supported only in timestamp mode:
+Specify the full generation name (`UTC timestamp` + `-` + 32 lowercase hexadecimal characters), without `.dump` or `.dump.gpg`. The name appears in the backup completion log and S3 key. An explicit generation selects that timestamped object in either filename mode:
 
 ```sh
 docker compose exec -e POSTGRES_DATABASE=app -e BACKUP_FILENAME_MODE=timestamp \
   backup postgres-backup-s3 restore 2026-09-12T10:00:00-0123456789abcdef0123456789abcdef
 ```
 
+### Partial backup
+
+Every backup made with `BACKUP_ALLOW_PARTIAL=true` uses a timestamped key under `v2/partial/`, even in fixed mode or when no filter was supplied. To restore one, use the exact generation printed in the backup log:
+
+```sh
+docker compose exec -e POSTGRES_DATABASE=app backup postgres-backup-s3 restore --partial 2026-09-12T10:00:00-0123456789abcdef0123456789abcdef
+```
+
+An ordinary restore selects only `v2/full/`. A schema-only restore can recreate tables without their rows. Use an empty target for partial restores.
+
 ### Specific S3 version
 
-For fixed filenames, obtain the VersionId from the S3 console's **Show versions** view or run `aws s3api list-object-versions` outside this image:
+For fixed filenames, obtain the VersionId of the reference at the fixed key from the S3 console's **Show versions** view or run `aws s3api list-object-versions` outside this image:
 
 ```sh
 docker compose exec -e POSTGRES_DATABASE=app -e BACKUP_FILENAME_MODE=fixed \
   backup postgres-backup-s3 restore --version-id '<VersionId>'
 ```
 
-Restore downloads and, if necessary, decrypts into temporary files, then checks the custom archive's table of contents before invoking `pg_restore --single-transaction --exit-on-error --clean --if-exists`. Download, decryption and archive-validation failures stop before database access. Allow disk space for the downloaded file and, for encrypted backups, the decrypted dump as well. Temporary files are removed on normal completion and handled failures.
+Restore downloads and, if necessary, decrypts into temporary files, then checks the custom archive's table of contents before invoking `pg_restore --single-transaction --exit-on-error --clean --if-exists`. Download, decryption and archive-validation failures stop before database access. If the archive contains subscriptions, restore checks for matching target subscriptions with associated replication slots. PostgreSQL cannot drop those subscriptions inside the restore transaction. Restore to an empty database and configure replication separately. Allow disk space for the downloaded file and, for encrypted backups, the decrypted dump as well. Downloaded, decrypted, and rewritten restore files lose their directory entry before their first write. Linux releases them when their last file descriptor closes, including after a forced termination. Cancellation gives pg_restore time to cancel its active PostgreSQL query before forcing the client to exit.
 
-Backups normally contain object definitions and data. Data-only backups (`--data-only`, `-a`, or section selections without `pre-data`) are always rejected, even with `BACKUP_ALLOW_PARTIAL=true`; schema-only backups require that explicit partial-backup permission. Restore rejects table/sequence data without the required definitions, including historical data-only backups. In particular, every `SEQUENCE SET` entry must have a matching sequence definition: changing an existing sequence with `setval` would not roll back after a later restore failure. Extension configuration tables are permitted when extension definitions are present, but sequence values without their own sequence definitions are rejected even for extensions. The metadata reader supports custom archive versions 1.14 through 1.16; unknown layouts are rejected before database access.
+Backups normally contain object definitions and data. Data-only backups (`--data-only`, `-a`, or section selections without `pre-data`) are always rejected, even with `BACKUP_ALLOW_PARTIAL=true`; schema-only backups require that explicit partial-backup permission. Restore rejects table/sequence data without the required definitions, including historical data-only backups. Ordinary sequence values require a matching sequence definition. Extension configuration tables and sequences can have data entries without separate definitions. Backup verifies their identities, kinds and owning extensions using the same PostgreSQL snapshot as the dump. Databases with user-installed extensions or FDW mappings can require two simultaneous application connections. The dump uses the host, numeric peer address (for TCP), and port selected by the snapshot connection, preserving the hostname for TLS verification. Catalog checks finish when the dump table of contents is available, and the exporter then closes. The database's idle-in-transaction timeout still applies while waiting for the TOC. A timeout during that phase fails the backup. If the login cannot verify an empty mapping, the checker also tries the requested dump role. When `--snapshot` is supplied, the catalog transaction imports it before sharing its snapshot with pg_dump.
+
+Backups containing extension definitions carry a catalog trailer inside the stored payload and inside encryption when enabled. Restore requires this metadata for those archives. It installs the recorded extension versions and verifies membership using SQL before restoring configuration rows or sequence values. These checks also work in databases without PL/pgSQL. Restoring a missing version fails the transaction. Foreign or unverifiable configuration data prevents publication. During restore, the foreign-table restriction covers only configuration rows, so later materialized view refreshes can read foreign tables. Reserve temporary space for an additional copy when restoring archives containing extensions. Use the built-in restore command for these checks. The metadata reader supports custom archive versions 1.14 through 1.16; unknown layouts are rejected before database access.
 
 Archives containing data must also contain independently verifiable pre-data object definitions. Session settings and `DATABASE`/`DATABASE PROPERTIES` entries are not evidence: they can also occur in data-only dumps. A database containing only large objects can produce full and data-only archives that cannot reliably be distinguished. Both are rejected, including historical backups. Large objects alongside ordinary object definitions remain supported. The same check runs during backup streaming, so ambiguous archives fail before publication and retention rather than creating a new unusable generation. Empty databases without data remain supported. This structural check does not prove completeness or validate every dependency/SQL statement.
 
@@ -169,18 +190,20 @@ These pass `--no-tablespaces` and `--no-table-access-method` to `pg_restore`. Th
 
 `PGDUMP_EXTRA_OPTS` also rejects `--extra-float-digits` (including values that would otherwise be accepted by PostgreSQL) so backups use PostgreSQL's default floating-point output precision. `--binary-upgrade` is rejected because its archives are intended for upgrade utilities, not ordinary restores. Rejected options stop backup before starting subprocesses, uploading objects, or deleting old generations.
 
-DB-level selection (`POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or discovery with `POSTGRES_DATABASES_EXCLUDE`) does not require partial-backup permission. Filtering the contents **inside** a selected database does. Set `BACKUP_ALLOW_PARTIAL=true` explicitly to use table/schema/extension selection or exclusion, `--filter=<file>`, `--section`, `--schema-only`, `--enable-row-security`, large-object/unlogged-data exclusion, or metadata exclusions (`--no-acl`/`--no-privileges`, `--no-comments`, `--no-publications`, `--no-security-labels`, `--no-subscriptions`). Short equivalents such as `-t`, `-n`, `-e`, `-T`, `-N`, `-s`, `-B`, and `-x` have the same requirement.
+DB-level selection (`POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or discovery with `POSTGRES_DATABASES_EXCLUDE`) does not require partial-backup permission. Filtering the contents **inside** a selected database does. Set `BACKUP_ALLOW_PARTIAL=true` explicitly to use table/schema/extension selection or exclusion, `--filter=<file>`, `--section`, `--schema-only`, `--enable-row-security`, large-object/unlogged-data exclusion, or metadata exclusions (`--no-acl`/`--no-privileges`, `--no-comments`, `--no-publications`, `--no-security-labels`, `--no-subscriptions`, `--no-toast-compression`). With INSERT dumps, `--on-conflict-do-nothing` also requires partial mode because conflicting rows can be skipped during restore. Existing archives retain the behavior chosen when they were created. Short equivalents such as `-t`, `-n`, `-e`, `-T`, `-N`, `-s`, `-B`, and `-x` have the same requirement.
 
 ```bash
 docker compose exec -e POSTGRES_DATABASE=app -e BACKUP_ALLOW_PARTIAL=true \
   -e PGDUMP_EXTRA_OPTS='--table=orders' backup postgres-backup-s3 backup
 ```
 
-Partial backups log a warning: selected objects may lack dependencies, excluded sections can omit constraints/indexes, and row security can limit the saved rows. Permission does not guarantee standalone restore, bypass archive validation, or relax the data-only ban. Use a separate `S3_PREFIX` for partial backups if they should not share fixed keys or retention with normal backups. The flag controls creation; restore still validates the archive independently.
+Partial backups log a warning: selected objects may lack dependencies, excluded sections can omit constraints/indexes, and row security can limit the saved rows. Permission does not guarantee standalone restore, bypass archive validation, or relax the data-only ban. Retention operates within the selected full or partial directory. The flag controls creation. Restoring a partial backup requires `--partial` and an explicit generation.
 
-`--filter=-` and empty filter paths are always rejected because `pg_dump` has no connected standard input. A filter file requires partial-backup permission even if its current contents select everything. `--no-synchronized-snapshots` is rejected because neither supported PostgreSQL client provides it. `--no-statistics` is accepted only with `pg_dump` 18 or newer: when requested, the application checks the actual executable with `pg_dump --version` before database discovery or S3 access. A failed/unrecognized version check stops backup. Ordinary options do not require this extra subprocess.
+`--filter=-` and empty filter paths are always rejected because `pg_dump` has no connected standard input. Foreign table definitions are supported. Archives containing data destined for a foreign table are rejected during backup and restore, because replaying rows could modify the upstream database. A filter file requires partial-backup permission even if its current contents select everything. `--no-synchronized-snapshots` is rejected because neither supported PostgreSQL client provides it. `--no-statistics` is accepted only with `pg_dump` 18 or newer: when requested, the application checks the actual executable with `pg_dump --version` before database discovery or S3 access. A failed/unrecognized version check stops backup. Ordinary options do not require this extra subprocess.
 
 Backups and restores acquire the same nonblocking file lock before accessing S3 or PostgreSQL. A competing operation fails immediately. The lock covers download, decryption and restore, and is inherited by child processes. This protects processes sharing the same lock file (normally in one container); separate containers need a shared lock filesystem or external coordination. It does not pause application writes.
+
+Populated materialized views are refreshed during restore. Their rows reflect the restored base tables and can differ from a stale view at backup time. Restore logs a warning when the archive requests a refresh.
 
 A single-transaction restore holds locks until completion. Databases with many objects may require more PostgreSQL lock resources; use a separate restore database and a planned application cutover when an in-place atomic restore is impractical.
 
@@ -194,7 +217,7 @@ Without Compose, use `docker exec -e POSTGRES_DATABASE=app <container name> post
 
 With encryption enabled, the backup pipeline is `pg_dump → GPG → S3`; otherwise it is `pg_dump → S3`. Neither plaintext nor encrypted dumps are saved locally. The plaintext `PGDMP` header is checked before forwarding output to GPG or S3; empty or non-custom output fails. The uncompressed table of contents is also checked while bytes continue through the stream, using the same structural rules as restore. The upload completes only after this check, `pg_dump`, and, when enabled, GPG succeed. Validation/producer failures abort multipart uploads and preserve the previous fixed-name backup; retention does not run for that failed database. Data may already have been sent as uncommitted parts when validation fails. This is not a full archive-integrity or restore-success check. S3 failures stop the pipeline.
 
-Uploads buffer parts in memory and send up to two concurrently. The part size stays fixed because the final stream length is unknown in advance. Smaller backups are buffered and sent in one request. Memory usage is proportional to a few parts; larger parts require more memory.
+Uploads buffer parts in memory and send up to two concurrently. The part size stays fixed because the final stream length is unknown in advance. Smaller backups are buffered and sent in one request. The configuration budgets six part sizes for concurrent buffers and allocation headroom. `S3_UPLOAD_BUFFER_BUDGET_MB` defaults to 1024 MiB. Increase it explicitly when selecting parts larger than 170 MiB, and allow additional container memory for archive metadata, subprocesses and the Go runtime. The budget validates the configuration and does not impose a process memory limit.
 
 TOC validation also retains object names/types, so databases with many objects need additional metadata memory. It does not buffer SQL definitions or the complete dump.
 
@@ -218,20 +241,24 @@ Use a separate `S3_PREFIX` per PostgreSQL server to avoid collisions between dat
 
 | `BACKUP_FILENAME_MODE` | Example key with `S3_PREFIX=backup` | Requirements |
 | --- | --- | --- |
-| `timestamp` (default) | `backup/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | UTC timestamp captured before each database dump plus a cryptographically random 128-bit generation ID. Existing generation keys cannot be overwritten. |
-| `fixed` | `backup/app.dump` | Uses the fixed key when versioning is confirmed or unversioned overwrite is explicitly allowed. Otherwise uses a timestamped key. |
+| `timestamp` (default) | `backup/v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | UTC timestamp captured before each database dump plus a cryptographically random 128-bit generation ID. Existing generation keys cannot be overwritten. |
+| `fixed` | `backup/v2/full/app.dump` | Uses the fixed key when versioning is confirmed or unversioned overwrite is explicitly allowed. Otherwise uses a timestamped key. |
 
-Encryption adds `.gpg` in either mode. Both modes percent-encode the database name: `a/b` becomes `a%2Fb`. Timestamp mode stores backups in a database directory; fixed mode stores `<encoded-database>.dump` directly under the prefix. This keeps fixed keys separate from timestamped backups.
+Encryption adds `.gpg` in either mode. Both modes percent-encode the database name: `a/b` becomes `a%2Fb`. Timestamp mode stores backups in a database directory; fixed mode stores `<encoded-database>.dump` under `v2/full/`. This keeps fixed keys separate from timestamped backups.
 
-Prefix separator handling remains unchanged:
+For example, `backup/v2/full/app.dump` contains a small text reference. The dump itself is published first, using a conditional write to `backup/v2/full/app.dump.generations/<32-hex-id>`. Encrypted backups use `app.dump.gpg` and `app.dump.gpg.generations/<id>`. The reference carries only the generation identifier. The built-in restore command follows it automatically, including when you select a historical VersionId. It pins a mutable S3 `null` version to its ETag during ranged downloads.
+
+If bucket versioning stops during a run, replacing the reference preserves the previous generation payload. An interrupted reference update can leave an unreferenced generation. For external tools that fetch the dump directly, read the identifier on the second line of the reference and download its generation object. To recover a retained payload whose reference version has expired, copy that payload to a separate restore prefix under a valid timestamped generation key for the original database, then restore the explicit generation from that prefix.
+
+Prefix separator examples:
 
 | `S3_PREFIX` | Timestamp example | Fixed example |
 | --- | --- | --- |
-| `backup` | `backup/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/app.dump` |
-| `backup/` | `backup//app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/app.dump` |
-| Empty | `/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `app.dump` |
+| `backup` | `backup/v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/v2/full/app.dump` |
+| `backup/` | `backup//v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/v2/full/app.dump` |
+| Empty | `/v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `v2/full/app.dump` |
 
-In fixed mode, each run calls `GetBucketVersioning` before the first dump and applies the result to every selected database. Custom S3 endpoints, including IDrive e2, use the same API. Timestamp mode skips this check.
+In fixed mode with `BACKUP_ALLOW_PARTIAL=false`, each run calls `GetBucketVersioning` before the first dump and applies the result to every selected database. Custom S3 endpoints, including IDrive e2, use the same API. Timestamp mode skips this check.
 
 | Versioning check in fixed mode | `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` unset or `false` | `BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true` |
 | --- | --- | --- |
@@ -239,27 +266,30 @@ In fixed mode, each run calls `GetBucketVersioning` before the first dump and ap
 | `Suspended` or successful response without `Status` | Log the reason and use timestamped keys | Warn and overwrite fixed keys |
 | Check failed (for example, `AccessDenied` or a network error) | Log the error and use timestamped keys | Warn and overwrite fixed keys |
 
-After a timestamped upload succeeds, the log prints the actual key and a command to restore that exact generation in the backup container. After a fallback, an argument-free restore in fixed mode still reads the previous fixed object, if one exists. Use the logged command with the same S3 settings and passphrase. Upload errors count as backup failures in either mode.
+After a timestamped upload succeeds, the log prints the actual key and a command to restore that exact generation in the backup container. An argument-free fixed-mode restore also considers successful fallback generations. Use the logged command with the same S3 settings and passphrase. Upload errors count as backup failures in either mode.
 
-Timestamp mode sends `If-None-Match: *` when publishing either a single-request upload or a completed multipart upload. A collision fails the backup and skips retention for that database; multipart data is aborted. The provider must enforce these conditional writes. No existence-check-then-write sequence is used.
+Timestamp mode sends `If-None-Match: *` when publishing either a single-request upload or a completed multipart upload. A collision fails the backup and skips retention for that database; multipart data is aborted. The provider must enforce these conditional writes. Each upload records a random publication ID in S3 object metadata. After an ambiguous response the client checks the current object with `HeadObject`. Only its own publication ID confirms success. A fixed-key single-request PUT is sent once to avoid creating duplicate versions.
 
 The wall clock is checked immediately before every publication/deletion HTTP attempt, including SDK retries after backoff, and after upload. If it is earlier than that database backup's start time, the run stops with an error and performs no further publication or deletion. Guard failures are not retryable. Multipart abort requests remain allowed so uploaded parts can be cleaned up. A rollback during an already-sent S3 request cannot retract that request or earlier completed database backups; the post-upload check still prevents retention for the failed backup.
 
 ### Backup retention
 
-**`BACKUP_KEEP_DAYS` deletes timestamped backups only, in either filename mode.** Switching to fixed mode leaves existing generation-ID backups subject to the same retention period. Legacy timestamp-only keys are excluded.
+**`BACKUP_KEEP_DAYS` deletes timestamped backups only, in either filename mode.** The listing is scoped to `v2/full/` or `v2/partial/`. Switching to fixed mode leaves full generations in the same retention scope. Legacy timestamp-only keys are excluded.
 
 | Object | Retention behavior |
 | --- | --- |
-| `app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` or `.dump.gpg` | Eligible after a successful backup of that database, when strictly older than the cutoff. |
-| `app.dump` or `.dump.gpg` | Never deleted by application retention. |
+| `v2/{full,partial}/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` or `.dump.gpg` | Eligible after a successful backup of that database, when strictly older than the cutoff. |
+| `v2/full/app.dump` or `.dump.gpg` | Never deleted by application retention. |
+| `v2/full/app.dump.generations/<id>` or `app.dump.gpg.generations/<id>` | Each generation remains a current object. Keep its payload as long as any retained reference version or recovery procedure needs it. |
 | S3 version history | Never deleted by application retention. Use S3 lifecycle rules. |
 
 Age uses S3 `LastModified`, with a day equal to 24 hours. After each successful database backup, the cutoff is the server time from the first listing response's HTTP `Date` header minus `BACKUP_KEEP_DAYS`. Later listing pages and the host clock do not move that cutoff. Backups exactly on the cutoff are retained, and the newly published key is explicitly excluded from deletion even if its timestamp appears old. Matching includes the complete database name and valid timestamp-ID suffix; other databases and unrelated objects are left alone.
 
 If the first listing response has a missing or invalid `Date`, retention deletes nothing for that database. The new backup remains saved, but the run reports a retention failure and returns nonzero for monitoring. S3-compatible providers and intervening proxies must supply an accurate, valid HTTP `Date`; there is no fallback to the host clock. Disabling retention does not require that header.
 
-Deleting an expired timestamped object in a versioned bucket creates a delete marker; stored versions remain. Use lifecycle **noncurrent version expiration** to remove old versions of timestamped or fixed-name backups. Noncurrent age starts when a version becomes noncurrent, not when the backup was created. Keep the current fixed-name version unexpired to retain the latest backup.
+Retention validates all listing pages before issuing deletions in batches of at most 1,000 keys. For more than 1,000 expired keys it spools key names to a temporary file, so the temporary directory must have space for the list. A per-key failure in a successful HTTP response is reported as a cleanup failure.
+
+Deleting an expired timestamped object in a versioned bucket creates a delete marker; stored versions remain. Use lifecycle **noncurrent version expiration** for old timestamped object versions or fixed reference versions. Generation payloads are distinct current objects. Expiring a reference version does not remove its payload. A lifecycle rule expiring current generation objects can also break retained references. Noncurrent age starts when a version becomes noncurrent, not when the backup was created. Keep the current fixed-name version unexpired to retain the latest backup.
 
 The application does not create or modify lifecycle rules. Existing rules still apply; use separate prefixes when backups need different policies. See [S3 versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) and [lifecycle rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html).
 
@@ -270,9 +300,9 @@ In addition to upload permissions and any bucket encryption/KMS permissions, gra
 | Operation | Permission |
 | --- | --- |
 | Confirm versioning for fixed-name backups | `s3:GetBucketVersioning` on the bucket. If denied, the run uses timestamped keys by default. |
-| Restore the current object | `s3:GetObject` on backup objects |
-| Restore a specific VersionId | `s3:GetObjectVersion` on backup objects |
-| Find the latest timestamped backup | `s3:ListBucket` on the bucket |
+| Confirm an ambiguous upload or restore the current object | `s3:GetObject` on backup objects |
+| Restore a specific VersionId | `s3:GetObjectVersion` on the fixed reference and `s3:GetObject` on its generation payload |
+| Restore without arguments, including in fixed mode | `s3:ListBucket` on the bucket |
 | Retention cleanup | `s3:ListBucket` on the bucket and `s3:DeleteObject` on backup objects |
 | List versions externally to choose a VersionId | `s3:ListBucketVersions` on the bucket |
 
@@ -291,13 +321,14 @@ Image-publishing secrets belong to the GitHub repository and are listed under [p
 | `POSTGRES_USER` | Unset | Required for backup and restore. PostgreSQL login user. |
 | `POSTGRES_PASSWORD` | Unset | Required and nonempty for backup and restore. Passed to PostgreSQL tools as `PGPASSWORD`. |
 | `POSTGRES_DATABASE` | Unset | Single database to back up; required for restore. For backup, `POSTGRES_DATABASES` takes precedence. |
-| `BACKUP_DATABASE_TIMEOUT` | `24h` | Positive Go duration for one database's source check, dump, encryption and upload combined. Discovery has its own interval of the same length. After a database times out, its retention is skipped and the run continues with the next database. |
+| `BACKUP_DATABASE_TIMEOUT` | `24h` | Positive Go duration for one database's source check, dump, encryption and upload combined. Discovery, the bucket versioning check and each retention pass have separate intervals of the same length. After a database times out, its retention is skipped and the run continues with the next database. |
 | `POSTGRES_DATABASES` | Unset | Comma-separated backup targets. Surrounding whitespace is trimmed and duplicates are removed. |
 | `POSTGRES_BACKUP_ALL` | `false` | Discover all connectable, non-template databases. When `true`, both database-selection variables above must be empty. |
 | `POSTGRES_DATABASES_EXCLUDE` | Unset | Comma-separated, exact database names to exclude. Valid only with `POSTGRES_BACKUP_ALL=true`. |
 | `POSTGRES_MAINTENANCE_DB` | `postgres` | Database used to discover targets in all-database mode. |
 | `PGDUMP_EXTRA_OPTS` | Unset | Validated `pg_dump` options, split on spaces, tabs and newlines. Compression is supported without partial permission; content/metadata selection requires `BACKUP_ALLOW_PARTIAL=true`. Data-only/statistics-only mode, sections without `pre-data`, stdin filters, `--no-synchronized-snapshots`, `--extra-float-digits`, `--binary-upgrade`, and ineffective custom-archive options listed under Restore are rejected, as are output path, format, connection overrides, positional arguments, help/version and abbreviated long names. `--no-statistics` requires a verified client version of at least 18. Shell quoting, expansion and globbing are not evaluated. |
 | `BACKUP_ALLOW_PARTIAL` | `false` | `true` permits explicit selection/exclusion of contents inside a database and logs a warning. Does not affect which databases are selected. Does not bypass archive validation or permit data-only/statistics-only backups. Only lowercase `true`/`false` are accepted. |
+| `RESTORE_TIMEOUT` | `24h` | Positive Go duration for the entire restore, including listing, download, decryption, validation and database work. |
 | `RESTORE_NO_OWNER` | `false` | `true` passes `--no-owner` to `pg_restore`, making restored objects owned by the login user. `false` preserves recorded owners. Only these two values are accepted; privileges are still restored. |
 | `RESTORE_NO_TABLESPACES` | `false` | `true` passes `--no-tablespaces` to `pg_restore`, placing objects in the restore session's default tablespace. `false` preserves recorded assignments and fails if a required tablespace is missing. Only `true`/`false` are accepted. |
 | `RESTORE_NO_TABLE_ACCESS_METHOD` | `false` | `true` passes `--no-table-access-method` to `pg_restore`, using the restore session's default table access method. `false` preserves recorded methods. Only `true`/`false` are accepted; this does not remove other extension/access-method dependencies. |
@@ -311,10 +342,10 @@ A backup requires `POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or `POSTGRES_BACKUP
 | Variable | Default | Required / behavior |
 | --- | --- | --- |
 | `SCHEDULE` | Unset | Omit to back up immediately and exit. Otherwise use a five- or six-field cron expression or a descriptor such as `@weekly`. Applies to the `run` command only; manual `backup` runs immediately. |
-| `PASSPHRASE` | Unset | Nonempty enables streaming GPG encryption. Use the same passphrase when restoring an encrypted backup. Empty selects unencrypted `.dump` files. Passed to GPG through a dedicated pipe, never as a process argument, and removed from child environments. Line breaks and NUL bytes are rejected to prevent silent truncation by GPG. |
+| `PASSPHRASE` | Unset | Nonempty enables streaming GPG encryption. Use the same passphrase when restoring an encrypted backup. Empty selects unencrypted `.dump` files. GPG receives the passphrase through a dedicated pipe. PostgreSQL and GPG child environments exclude S3 and AWS settings. Only PostgreSQL clients receive the database password. Line breaks and NUL bytes are rejected to prevent silent truncation by GPG. |
 | `BACKUP_KEEP_DAYS` | Unset | Omit to disable retention. Otherwise an integer from `1` to `36500`, without leading zeros. Deletes only expired timestamped backups after a successful backup of that database. |
 | `BACKUP_FILENAME_MODE` | `timestamp` | `timestamp` or `fixed`. Fixed mode checks bucket versioning before choosing the key format for the run. |
-| `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` | `false` | In fixed mode, `true` allows overwriting the fixed key even when versioning is suspended, absent or unverifiable. The previous backup may be lost. Only lowercase `true` and `false` are valid. An explicitly empty value is an error. |
+| `BACKUP_ALLOW_UNVERSIONED_OVERWRITE` | `false` | In fixed mode, `true` allows overwriting the fixed key even when versioning is suspended, absent or unverifiable. Previous reference history may be lost. Generation payloads written by this layout retain their individual keys. Only lowercase `true` and `false` are valid. An explicitly empty value is an error. |
 
 ### S3 destination and credentials
 
@@ -324,9 +355,10 @@ A backup requires `POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or `POSTGRES_BACKUP
 | `S3_REGION` | `us-west-1` | Region used by the application. Takes precedence over AWS region environment variables and profile settings. |
 | `S3_PREFIX` | `backup` | Object-key prefix. An explicitly empty value is preserved; timestamp keys then start with `/`. Trailing slashes are preserved according to the [filename-mode rules](#filenames-and-versioning). |
 | `S3_ENDPOINT` | Unset | Custom `http://` or `https://` S3 endpoint. Uses path-style addressing. Do not include URL credentials, a query or a fragment. Takes precedence over SDK endpoint settings. |
-| `S3_ACCESS_KEY_ID` | Unset | Overrides `AWS_ACCESS_KEY_ID` / `AWS_ACCESS_KEY` when nonempty. Optional when using the default credential chain. |
-| `S3_SECRET_ACCESS_KEY` | Unset | Overrides `AWS_SECRET_ACCESS_KEY` / `AWS_SECRET_KEY` when nonempty. |
-| `S3_SESSION_TOKEN` | Unset | Optional temporary-credential token; overrides `AWS_SESSION_TOKEN` when nonempty. |
+| `S3_ACCESS_KEY_ID` | Unset | Access key for an explicit S3 credential pair. |
+| `S3_SECRET_ACCESS_KEY` | Unset | Secret key for the same explicit S3 credential pair. |
+| `S3_SESSION_TOKEN` | Unset | Optional temporary token belonging to the explicit S3 credential pair. |
+| `S3_UPLOAD_BUFFER_BUDGET_MB` | `1024` | Upload buffer budget in MiB. Must cover at least six times the configured part size. |
 | `S3_UPLOAD_PART_SIZE_MB` | `8` | Integer from `5` to `5120`, in **MiB**. Larger parts increase the maximum streamed backup size and memory usage. See [streaming and large backups](#streaming-and-large-backups). |
 | `S3_S3V4` | `no` | Legacy compatibility variable, ignored by the Go implementation. Requests already use Signature Version 4. |
 | `AWS_ACCESS_KEY_ID` | Unset | Standard AWS access key, used when no S3 access-key override is set. |
@@ -335,11 +367,11 @@ A backup requires `POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or `POSTGRES_BACKUP
 | `AWS_ACCESS_KEY` | Unset | Legacy fallback for `AWS_ACCESS_KEY_ID`. |
 | `AWS_SECRET_KEY` | Unset | Legacy fallback for `AWS_SECRET_ACCESS_KEY`. |
 
-If any `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` or `S3_SESSION_TOKEN` override is set, a complete access-key/secret-key pair must be available from the `S3_*` and/or `AWS_*` environment variables. These overrides are not merged with credentials from profiles or IAM roles. With no S3 overrides, the AWS SDK uses its default credential chain.
+If any `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` or `S3_SESSION_TOKEN` override is set, both `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` are required. The explicit pair uses only `S3_SESSION_TOKEN`. With no S3 overrides, the AWS SDK uses its default credential chain.
 
 ### Additional SDK and client settings
 
-The AWS SDK and PostgreSQL/GPG tools also read their own environment variables. Common operational settings are listed here; the linked upstream references describe further dependency-specific options and their version-dependent support.
+Upload settings and backup timeouts are validated for backup and scheduled runs. Restore validates its own timeout and placement options. The AWS SDK and PostgreSQL/GPG tools also read their own environment variables. Common operational settings are listed here; the linked upstream references describe further dependency-specific options and their version-dependent support.
 
 | Variable | Default / behavior |
 | --- | --- |
@@ -358,12 +390,12 @@ The AWS SDK and PostgreSQL/GPG tools also read their own environment variables. 
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | Authorization for a container credential endpoint, when required by the platform. |
 | `AWS_EC2_METADATA_DISABLED` | Set to `true` to disable EC2 instance-metadata credential discovery. |
 | `PGCONNECT_TIMEOUT` | PostgreSQL connection timeout in seconds; inherited by `psql`, `pg_dump` and `pg_restore`. |
-| `PGSSLMODE` | PostgreSQL TLS mode, for example `require` or `verify-full`. |
+| `PGSSLMODE` | PostgreSQL TLS mode. Defaults to `verify-full` for PostgreSQL child processes. |
 | `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | PostgreSQL CA certificate, client certificate and private-key paths inside the container. |
 | `PGOPTIONS`, `PGAPPNAME` | Extra PostgreSQL session options and application name. |
 | `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD` | Do not use these as substitutes for the required `POSTGRES_*` settings: connection arguments are supplied explicitly, and `PGPASSWORD` is overwritten with `POSTGRES_PASSWORD`. |
 | `TZ` | Local timezone for scheduling, normally UTC in the image. `CRON_TZ=...` inside `SCHEDULE` overrides the schedule timezone; `CRON_TZ` is not a separate application environment variable. Backup timestamps remain UTC. |
-| `TMPDIR` | Restore temporary-file directory; `/tmp` when unset. Streaming backups do not save dumps there. The backup lock remains at `/tmp/postgres-backup-s3.lock`. |
+| `TMPDIR` | Temporary directory for restore files and large retention key lists; `/tmp` when unset. Streaming backups do not save dumps there. The backup lock remains at `/tmp/postgres-backup-s3-lock/operation.lock`. |
 | `GNUPGHOME` | GPG configuration/keyring directory; normally `~/.gnupg`. |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | HTTP/HTTPS proxy configuration for the SDK's HTTP client; lowercase equivalents are also supported. |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Optional certificate-file/directory overrides for Go's system certificate pool on Linux. |
@@ -484,20 +516,23 @@ PostgreSQL 12–16 images are no longer built, tested or updated. Previously pub
 
 ### Repository Compose fixture
 
-The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 18 backup image on Alpine 3.23 and starts a PostgreSQL 18 development server. It still needs an S3 bucket and credentials:
+The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 18 backup image on Alpine 3.23 and starts a PostgreSQL 18 development server. It requires a nonempty `PASSPHRASE` before Compose starts the services, along with an S3 bucket and credentials.
 
 ```sh
 cp template.env .env
-# Fill in S3_REGION, S3_BUCKET and credentials in .env.
+# Set PASSPHRASE, S3_REGION, S3_BUCKET and credentials in .env.
+# Temporary S3 credentials also require S3_SESSION_TOKEN.
 docker compose up -d --build
 docker compose exec backup postgres-backup-s3 backup
 ```
 
 ## Compatibility
 
+Argument-free fixed-mode restore now requires `s3:ListBucket` and selects the newest full backup across both key formats. Explicit S3 credentials must form a complete `S3_*` pair. The shared lock moved to `/tmp/postgres-backup-s3-lock/operation.lock`; drain older processes before switching images and update shared lock mounts. Foreign table data archives are rejected. `--no-toast-compression` requires partial mode.
+
 Supported PostgreSQL image tags are now `17` and `18`; updates for tags `12`–`16` have ended. The default build and development Compose server have moved to PostgreSQL 18. Custom builds must use `POSTGRES_VERSION` to select the client major version; changing `ALPINE_VERSION` no longer selects it.
 
-The Go implementation preserves existing runtime configuration, `.dump` / `.dump.gpg` formats and shell entrypoints:
+The Go implementation uses `.dump` / `.dump.gpg` formats and provides these shell entrypoints:
 
 | Legacy entrypoint | Equivalent command |
 | --- | --- |
@@ -517,9 +552,9 @@ Dump connections now require the primary/standby role observed by preflight, ove
 
 Metadata queries now override inherited `search_path` settings with `pg_catalog, pg_temp`; custom functions, aggregates or catalog lookalikes in application schemas are no longer used for database discovery or source checks.
 
-The key layout is now `<encoded-database>.dump` for fixed mode and `<encoded-database>/<timestamp>-<generation-ID>.dump` for timestamp mode, relative to the configured prefix (with `.gpg` added for encryption). Previous `<encoded-database>/latest.dump` fixed objects and flat `<database>_<timestamp>.dump` timestamped objects are not migrated or selected by restore or retention. Retrieve those backups and their VersionIds using their original S3 keys. Timestamp-only restore arguments are no longer accepted. Timestamp-only directory keys are also excluded from automatic restore and retention. Restore requires the complete new generation name; fixed-mode `--version-id ID` is unchanged.
+Full backups now use `v2/full/<encoded-database>.dump` for fixed mode and `v2/full/<encoded-database>/<timestamp>-<generation-ID>.dump` for timestamp mode. Partial backups always use `v2/partial/<encoded-database>/<timestamp>-<generation-ID>.dump`. Paths are relative to the configured prefix, with `.gpg` added for encryption. Restore and retention ignore every previous unclassified key, including prior generation-ID and fixed keys. Take a new full backup before relying on automatic restore. Review any prefix-scoped IAM or lifecycle rules for the new paths. Previous `<encoded-database>/latest.dump` fixed objects and flat `<database>_<timestamp>.dump` timestamped objects are not migrated or selected by restore or retention. Retrieve those backups and their VersionIds using their original S3 keys. Timestamp-only restore arguments are no longer accepted. Timestamp-only directory keys are also excluded from automatic restore and retention. Restore requires the complete new generation name; fixed-mode `--version-id ID` is unchanged.
 
-Deployments that previously updated fixed keys on `AccessDenied` now write timestamped generations by default. To keep updating the fixed key, enable bucket versioning and grant the backup credentials `s3:GetBucketVersioning`, or set `BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true` to accept possible loss of the previous backup.
+Deployments that previously updated fixed keys on `AccessDenied` now write timestamped generations by default. To keep updating the fixed key, enable bucket versioning and grant the backup credentials `s3:GetBucketVersioning`, or set `BACKUP_ALLOW_UNVERSIONED_OVERWRITE=true` to allow replacement of the current reference without S3 version history.
 
 ## Acknowledgements and license
 

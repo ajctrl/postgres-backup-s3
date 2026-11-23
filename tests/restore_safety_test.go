@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
 
 // Minimal custom-archive TOC for fake pg_restore. The real PostgreSQL integration
 // tests exercise archives produced and consumed by the actual client binaries.
-func restoreArchiveFixture(dataOnly bool) []byte {
+func restoreArchiveFixture(dataOnly bool) []byte { return namedArchiveFixture("app", dataOnly) }
+func namedArchiveFixture(database string, dataOnly bool) []byte {
 	var b bytes.Buffer
 	b.Write([]byte{'P', 'G', 'D', 'M', 'P', 1, 16, 0, 4, 8, 1, 0})
 	integer := func(n int32) {
@@ -26,7 +28,8 @@ func restoreArchiveFixture(dataOnly bool) []byte {
 	for range 7 {
 		integer(0)
 	}
-	for range 3 {
+	field(database)
+	for range 2 {
 		field("")
 	}
 	integer(2)
@@ -82,6 +85,27 @@ func TestRestoreRejectsDataOnlyAndInvalidArchivesBeforeDatabaseAccess(t *testing
 			assertEqual(t, len(f.processes("psql")), 0)
 		}
 	}
+}
+
+func TestWrongArchiveDatabaseStopsBackupAndRestore(t *testing.T) {
+	f := newFixture(t)
+	f.env["POSTGRES_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
+	other := namedArchiveFixture("other", false)
+	if err := os.WriteFile(f.env["FAKE_DUMP_FILE"], other, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.s3.downloadBody = other
+	for _, command := range []string{"restore", "backup"} {
+		output := f.run(false, command)
+		if !strings.Contains(output, "does not match requested name") {
+			t.Fatalf("%s: %s", command, output)
+		}
+		if command == "restore" {
+			assertEqual(t, len(f.processes("psql")), 0)
+		}
+	}
+	assertEqual(t, len(f.s3.calls("PUT")), 0)
+	assertEqual(t, len(f.processes("pg_restore")), 0)
 }
 
 func TestRestoreOptionsAreExplicitAndIndependent(t *testing.T) {

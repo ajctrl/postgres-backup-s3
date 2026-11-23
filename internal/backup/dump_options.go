@@ -8,7 +8,11 @@ import (
 type dumpOptions struct {
 	args           []string
 	partial        bool
+	skipConflicts  bool
 	minClientMajor int
+	snapshot       string
+	role           string
+	serializable   bool
 }
 
 // Only complete, known option names are accepted. A denylist would miss getopt
@@ -57,12 +61,25 @@ func parseDumpOptions(value string, allowPartial bool) (*dumpOptions, error) {
 				}
 				value = args[i]
 			}
+			if name == "role" {
+				result.role = value
+			}
+			if name == "snapshot" {
+				result.snapshot = value
+			}
+			if name == "serializable-deferrable" {
+				result.serializable = true
+			}
 			if name == "section" {
 				sections = true
 				preData = preData || value == "pre-data"
 			}
 			if name == "filter" && (value == "-" || value == "") {
 				return nil, fmt.Errorf("PGDUMP_EXTRA_OPTS: --filter requires a file path; standard input (-) is not connected")
+			}
+			if name == "on-conflict-do-nothing" {
+				result.skipConflicts = true
+				result.partial = true
 			}
 			if name == "no-statistics" {
 				result.minClientMajor = 18
@@ -72,7 +89,7 @@ func parseDumpOptions(value string, allowPartial bool) (*dumpOptions, error) {
 				"exclude-schema", "exclude-table", "exclude-table-data", "exclude-table-and-children",
 				"exclude-table-data-and-children", "exclude-extension", "schema-only", "enable-row-security",
 				"no-blobs", "no-large-objects", "no-unlogged-table-data", "no-privileges", "no-acl",
-				"no-comments", "no-publications", "no-security-labels", "no-subscriptions":
+				"no-toast-compression", "no-comments", "no-publications", "no-security-labels", "no-subscriptions":
 				result.partial = true
 			}
 			continue

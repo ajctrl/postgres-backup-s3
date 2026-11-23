@@ -11,6 +11,9 @@ import (
 	"github.com/bartels/postgres-backup-s3/internal/storage"
 )
 
+// Two active parts, producer/read-ahead buffers and allocation headroom.
+const uploadBufferParts = 6
+
 type Config struct {
 	Database, Databases, BackupAll, Exclude, MaintenanceDB string
 	Host, Port, User, Password, DumpOptions                string
@@ -18,15 +21,15 @@ type Config struct {
 	RestoreNoOwner                                         bool
 	RestoreNoTablespaces, RestoreNoTableAccessMethod       bool
 	AllowPartial, AllowUnversionedOverwrite                bool
-	DatabaseTimeout                                        time.Duration
+	DatabaseTimeout, RestoreTimeout                        time.Duration
 	Storage                                                storage.Config
 }
 
-func LoadConfig() (Config, error) {
-	return loadConfig(os.LookupEnv)
+func LoadConfig(command string) (Config, error) {
+	return loadConfig(command, os.LookupEnv)
 }
 
-func loadConfig(lookup func(string) (string, bool)) (Config, error) {
+func loadConfig(command string, lookup func(string) (string, bool)) (Config, error) {
 	get := func(key string) string { value, _ := lookup(key); return value }
 	valueOr := func(key, fallback string) string {
 		if value := get(key); value != "" {
@@ -48,7 +51,7 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 		FilenameMode: valueOr("BACKUP_FILENAME_MODE", "timestamp"), Schedule: get("SCHEDULE"),
 		Storage: storage.Config{
 			Bucket: get("S3_BUCKET"), Region: valueOr("S3_REGION", "us-west-1"), Endpoint: get("S3_ENDPOINT"),
-			AccessKeyID: get("S3_ACCESS_KEY_ID"), SecretAccessKey: get("S3_SECRET_ACCESS_KEY"),
+			AccessKeyID: get("S3_ACCESS_KEY_ID"), SecretAccessKey: get("S3_SECRET_ACCESS_KEY"), SessionToken: get("S3_SESSION_TOKEN"),
 		},
 	}
 	for _, required := range []struct{ name, value string }{
@@ -68,38 +71,63 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	if c.FilenameMode != "timestamp" && c.FilenameMode != "fixed" {
 		return c, fmt.Errorf("BACKUP_FILENAME_MODE must be timestamp or fixed.")
 	}
-	if value, set := lookup("BACKUP_ALLOW_UNVERSIONED_OVERWRITE"); set {
-		if value != "true" && value != "false" {
-			return c, fmt.Errorf("BACKUP_ALLOW_UNVERSIONED_OVERWRITE must be true or false.")
+	var err error
+	boolSetting := func(name string, dst *bool) error {
+		value, ok := lookup(name)
+		if !ok {
+			return nil
 		}
-		c.AllowUnversionedOverwrite = value == "true"
-	}
-	partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
-	if err != nil || partSize < 5 || partSize > 5120 {
-		return c, fmt.Errorf("S3_UPLOAD_PART_SIZE_MB must be an integer between 5 and 5120 (MiB).")
-	}
-	c.Storage.UploadPartSizeBytes = partSize * 1024 * 1024
-	if value := get("BACKUP_DATABASE_TIMEOUT"); value != "" {
-		c.DatabaseTimeout, err = time.ParseDuration(value)
-		if err != nil || c.DatabaseTimeout <= 0 {
-			return c, fmt.Errorf("BACKUP_DATABASE_TIMEOUT must be a positive duration such as 30m or 24h.")
+		if value == "" && name != "BACKUP_ALLOW_UNVERSIONED_OVERWRITE" {
+			value = "false"
 		}
-	}
-	for _, setting := range []struct {
-		name string
-		dest *bool
-	}{
-		{"RESTORE_NO_OWNER", &c.RestoreNoOwner},
-		{"RESTORE_NO_TABLESPACES", &c.RestoreNoTablespaces},
-		{"RESTORE_NO_TABLE_ACCESS_METHOD", &c.RestoreNoTableAccessMethod},
-		{"BACKUP_ALLOW_PARTIAL", &c.AllowPartial},
-	} {
-		switch valueOr(setting.name, "false") {
+		switch value {
 		case "true":
-			*setting.dest = true
+			*dst = true
 		case "false":
+			*dst = false
 		default:
-			return c, fmt.Errorf("%s must be true or false.", setting.name)
+			return fmt.Errorf("%s must be true or false.", name)
+		}
+		return nil
+	}
+	if command == "restore" {
+		if value := get("RESTORE_TIMEOUT"); value != "" {
+			c.RestoreTimeout, err = time.ParseDuration(value)
+			if err != nil || c.RestoreTimeout <= 0 {
+				return c, fmt.Errorf("RESTORE_TIMEOUT must be a positive duration")
+			}
+		}
+		for _, setting := range []struct {
+			name string
+			dst  *bool
+		}{
+			{"RESTORE_NO_OWNER", &c.RestoreNoOwner}, {"RESTORE_NO_TABLESPACES", &c.RestoreNoTablespaces}, {"RESTORE_NO_TABLE_ACCESS_METHOD", &c.RestoreNoTableAccessMethod},
+		} {
+			if err := boolSetting(setting.name, setting.dst); err != nil {
+				return c, err
+			}
+		}
+	} else {
+		if err := boolSetting("BACKUP_ALLOW_PARTIAL", &c.AllowPartial); err != nil {
+			return c, err
+		}
+		if err := boolSetting("BACKUP_ALLOW_UNVERSIONED_OVERWRITE", &c.AllowUnversionedOverwrite); err != nil {
+			return c, err
+		}
+		partSize, err := strconv.ParseInt(valueOr("S3_UPLOAD_PART_SIZE_MB", "8"), 10, 64)
+		if err != nil || partSize < 5 || partSize > 5120 {
+			return c, fmt.Errorf("S3_UPLOAD_PART_SIZE_MB must be an integer between 5 and 5120 (MiB).")
+		}
+		budget, err := strconv.ParseInt(valueOr("S3_UPLOAD_BUFFER_BUDGET_MB", "1024"), 10, 64)
+		if err != nil || budget <= 0 || partSize*uploadBufferParts > budget {
+			return c, fmt.Errorf("S3_UPLOAD_BUFFER_BUDGET_MB must cover at least %d MiB for %d MiB parts", partSize*uploadBufferParts, partSize)
+		}
+		c.Storage.UploadPartSizeBytes = partSize * 1024 * 1024
+		if value := get("BACKUP_DATABASE_TIMEOUT"); value != "" {
+			c.DatabaseTimeout, err = time.ParseDuration(value)
+			if err != nil || c.DatabaseTimeout <= 0 {
+				return c, fmt.Errorf("BACKUP_DATABASE_TIMEOUT must be a positive duration such as 30m or 24h.")
+			}
 		}
 	}
 	if err := validatePassphrase(c.Passphrase); err != nil {
@@ -108,11 +136,17 @@ func loadConfig(lookup func(string) (string, bool)) (Config, error) {
 	return c, nil
 }
 
-func (c Config) validateBackup() (int, error) {
-	if err := validatePassphrase(c.Passphrase); err != nil {
-		return 0, err
+func (c Config) validateBackup() (int, *dumpOptions, error) {
+	days, err := c.validateSelectionAndRetention()
+	if err != nil {
+		return 0, nil, err
 	}
-	if _, err := parseDumpOptions(c.DumpOptions, c.AllowPartial); err != nil {
+	opts, err := parseDumpOptions(c.DumpOptions, c.AllowPartial)
+	return days, opts, err
+}
+
+func (c Config) validateSelectionAndRetention() (int, error) {
+	if err := validatePassphrase(c.Passphrase); err != nil {
 		return 0, err
 	}
 	switch c.BackupAll {
@@ -205,8 +239,15 @@ func (c Config) fileType() string {
 	return ".dump"
 }
 
+func (c Config) scope() string {
+	if c.AllowPartial {
+		return "v2/partial/"
+	}
+	return "v2/full/"
+}
+
 func (c Config) timestampPrefix(database string) string {
-	return c.Prefix + "/" + databaseKeyComponent(database) + "/"
+	return c.Prefix + "/" + c.scope() + databaseKeyComponent(database) + "/"
 }
 
 func (c Config) fixedKey(database string) string {
@@ -214,7 +255,7 @@ func (c Config) fixedKey(database string) string {
 	if prefix != "" {
 		prefix += "/"
 	}
-	return prefix + databaseKeyComponent(database) + c.fileType()
+	return prefix + c.scope() + databaseKeyComponent(database) + c.fileType()
 }
 
 func databaseKeyComponent(database string) string {

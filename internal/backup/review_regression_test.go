@@ -39,8 +39,8 @@ func TestRetentionUsesServerClockAndProtectsPublishedKey(t *testing.T) {
 				date := serverTime
 				s := &retentionProbeStore{uploadTime: serverTime}
 				s.serverTime = &date
-				old := "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump"
-				recent := "backup/app/2000-01-02T00:00:00-0123456789abcdef0123456789abcdef.dump"
+				old := "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump"
+				recent := "backup/v2/full/app/2000-01-02T00:00:00-0123456789abcdef0123456789abcdef.dump"
 				s.objects = []storage.Object{{Key: old, LastModified: serverTime.Add(-8 * 24 * time.Hour)}, {Key: recent, LastModified: serverTime.Add(-6 * 24 * time.Hour)}}
 				localTime := serverTime.Add(30 * 24 * time.Hour)
 				if scenario == "host behind" {
@@ -149,13 +149,13 @@ func TestRestoreDiagnosticsNeverExposeSQLOrSecrets(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	var log bytes.Buffer
-	err := (commandRunner{stderr: &log}).restore(t.Context())
+	err := (commandRunner{stderr: &log}).restore(t.Context(), nil)
 	if err == nil || !strings.Contains(err.Error(), "pg_restore failed") || strings.Contains(err.Error(), "synthetic-secret") || log.Len() != 0 {
 		t.Fatalf("unsafe diagnostics: %v %s", err, &log)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if err := (commandRunner{stderr: &log}).restore(ctx); err == nil {
+	if err := (commandRunner{stderr: &log}).restore(ctx, nil); err == nil {
 		t.Fatal("cancellation reported success")
 	}
 }

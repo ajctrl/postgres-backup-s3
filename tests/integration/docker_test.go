@@ -5,6 +5,7 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,53 @@ import (
 // Pin the distroless multi-platform image from the official Silo release.
 // https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z
 const defaultS3TestImage = "docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless@sha256:472f59c7be537571f0f9a2ee6b8fe033a220939d521255bd4bf5339e53db7218"
+
+// TestDevelopmentCompose checks interpolation without starting services or using
+// any settings from the developer's environment or project .env.
+func TestDevelopmentCompose(t *testing.T) {
+	binary, args := "docker", []string{"compose"}
+	if _, err := exec.LookPath(binary); err != nil {
+		binary, args = "docker-compose", nil
+	}
+	args = append(args, "--env-file", os.DevNull, "-f", "../../docker-compose.yaml", "config", "--format", "json")
+	for _, tc := range []struct {
+		name, setting string
+	}{
+		{"unset", ""},
+		{"empty", "PASSPHRASE="},
+		{"set", "PASSPHRASE=compose-test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), binary, args...)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "S3_SESSION_TOKEN=session-test"}
+			if tc.setting != "" {
+				cmd.Env = append(cmd.Env, tc.setting)
+			}
+			var diagnostics bytes.Buffer
+			cmd.Stderr = &diagnostics
+			output, err := cmd.Output()
+			if tc.name != "set" {
+				if err == nil || !strings.Contains(diagnostics.String(), "PASSPHRASE") {
+					t.Fatalf("expected passphrase error, got %v %s", err, &diagnostics)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("compose config: %v %s", err, &diagnostics)
+			}
+			var project struct {
+				Services map[string]struct{ Environment map[string]string }
+			}
+			if err := json.Unmarshal(output, &project); err != nil {
+				t.Fatal(err)
+			}
+			env := project.Services["backup"].Environment
+			if env["PASSPHRASE"] != "compose-test" || env["S3_SESSION_TOKEN"] != "session-test" {
+				t.Fatal("backup service did not receive the configured passphrase and token")
+			}
+		})
+	}
+}
 
 // TestDockerBackupRestore requires a local Docker daemon and an already-built
 // backup image. All credentials, containers and stored data belong to this test.
@@ -100,7 +148,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 	}
 	baseEnv := map[string]string{
-		"POSTGRES_HOST": "127.0.0.1", "POSTGRES_USER": "integration", "POSTGRES_PASSWORD": "integration-password", "PGCONNECT_TIMEOUT": "10",
+		"PGSSLMODE": "disable", "POSTGRES_HOST": "127.0.0.1", "POSTGRES_USER": "integration", "POSTGRES_PASSWORD": "integration-password", "PGCONNECT_TIMEOUT": "10",
 		"POSTGRES_DATABASE": "app", "S3_BUCKET": bucket, "S3_REGION": "us-east-1", "S3_ENDPOINT": "http://127.0.0.1:9000",
 		"S3_ACCESS_KEY_ID": "integration", "S3_SECRET_ACCESS_KEY": "integration-password",
 	}
@@ -146,7 +194,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "timestamp"}
 		// Exercise the default CMD as well as the legacy restore wrapper.
 		runBackupImage(t, env)
-		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("timestamp/app/")})
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("timestamp/v2/full/app/")})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +220,7 @@ func TestDockerBackupRestore(t *testing.T) {
 			t.Fatalf("backup is not a PostgreSQL custom-format dump: header %q, error %v", header, readErr)
 		}
 		sql(t, "UPDATE backup_probe SET value = 'changed after backup'")
-		generation := strings.TrimSuffix(strings.TrimPrefix(aws.ToString(objects.Contents[0].Key), "timestamp/app/"), ".dump")
+		generation := strings.TrimSuffix(strings.TrimPrefix(aws.ToString(objects.Contents[0].Key), "timestamp/v2/full/app/"), ".dump")
 		runBackupImage(t, env, "sh", "restore.sh", generation)
 		assertValue(t, "original")
 	}) {
@@ -246,7 +294,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create historical data-only archive: %v", err)
 		}
-		_, err = client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("data-only/app.dump"), Body: bytes.NewReader(body)})
+		_, err = client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("data-only/v2/full/app.dump"), Body: bytes.NewReader(body)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -278,7 +326,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		lobSQL("SELECT lo_put(90000, 0, convert_to('newer', 'UTF8'))")
 		env := map[string]string{"S3_PREFIX": "lo-only", "POSTGRES_DATABASE": "lob_only", "BACKUP_FILENAME_MODE": "fixed"}
 		for _, body := range archives {
-			if _, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("lo-only/lob_only.dump"), Body: bytes.NewReader(body)}); err != nil {
+			if _, err := client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("lo-only/v2/full/lob_only.dump"), Body: bytes.NewReader(body)}); err != nil {
 				t.Fatal(err)
 			}
 			output, err := runImage(t, env, "postgres-backup-s3", "restore")
@@ -301,7 +349,7 @@ func TestDockerBackupRestore(t *testing.T) {
 	})
 	t.Run("fixed_encrypted_versions", func(t *testing.T) {
 		env := map[string]string{"S3_PREFIX": "fixed/", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
-		key := "fixed/app.dump.gpg"
+		key := "fixed/v2/full/app.dump.gpg"
 		version := func() string {
 			t.Helper()
 			object, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
@@ -340,7 +388,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 		// /proc cannot hold temporary dump files. Only streaming can succeed here.
 		runBackupImage(t, env, "postgres-backup-s3", "backup")
-		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("streaming/app/")})
+		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("streaming/v2/full/app/")})
 		if err != nil || len(objects.Contents) != 1 {
 			t.Fatalf("expected one multipart generation: %v, %v", objects, err)
 		}

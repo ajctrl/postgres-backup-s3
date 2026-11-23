@@ -29,7 +29,7 @@ func TestRetentionStopsRetryAfterClockRollback(t *testing.T) {
 		case "PUT":
 			w.Header().Set("ETag", `"new"`)
 		case "GET":
-			fmt.Fprint(w, `<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump</Key><LastModified>2000-01-01T00:00:00Z</LastModified><Size>100</Size></Contents></ListBucketResult>`)
+			fmt.Fprint(w, `<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump</Key><LastModified>2000-01-01T00:00:00Z</LastModified><Size>100</Size></Contents></ListBucketResult>`)
 		case "DELETE":
 			if attempts.Add(1) == 1 {
 				rolledBack.Store(true)

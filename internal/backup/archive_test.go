@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 	"testing"
 	"time"
 )
+
+func checkArchiveSchema(ctx context.Context, input io.Reader) error {
+	return inspectArchive(ctx, input, archiveChecks{})
+}
 
 type tocFixture struct {
 	name, kind, namespace, definition, drop string
@@ -40,7 +45,8 @@ func customArchiveFixture(minor byte, entries ...tocFixture) []byte {
 	for range 7 {
 		integer(0)
 	}
-	for range 3 {
+	field("app")
+	for range 2 {
 		field("")
 	}
 	integer(int32(len(entries)))
@@ -211,5 +217,20 @@ CREATE MATERIALIZED VIEW mv AS SELECT * FROM probe;`)
 UPDATE pg_extension SET extconfig=ARRAY['extension_config'::regclass::oid], extcondition=ARRAY[''] WHERE extname='hstore';`)
 	if err := checkArchiveSchema(t.Context(), bytes.NewReader(dump())); err != nil {
 		t.Fatalf("extension configuration: %v", err)
+	}
+}
+
+func BenchmarkArchiveTableOfContents(b *testing.B) {
+	entries := make([]tocFixture, 10000)
+	for i := range entries {
+		entries[i] = tocFixture{name: fmt.Sprint("table", i), namespace: "public", kind: "TABLE", section: 2, definition: "CREATE TABLE a(x int)", drop: "DROP TABLE a"}
+	}
+	data := customArchiveFixture(16, entries...)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	for b.Loop() {
+		if err := inspectArchive(b.Context(), bytes.NewReader(data), archiveChecks{}); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

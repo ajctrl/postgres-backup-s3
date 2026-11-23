@@ -16,13 +16,12 @@ import (
 // Layout: PostgreSQL src/bin/pg_dump/{pg_backup_archiver,pg_backup_custom}.c,
 // ReadHead, ReadToc, and _ReadExtraToc. Archive versions 1.14 through 1.16 cover
 // the supported PostgreSQL clients; unknown layouts fail closed.
-func validateRestoreArchive(ctx context.Context, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
+func validateRestoreArchive(ctx context.Context, f *os.File, metadata *archiveMetadata) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	defer f.Close()
-	if err := checkArchiveSchema(ctx, f); err != nil {
+	metadata.layout = &tocLayout{}
+	if err := inspectArchive(ctx, f, archiveChecks{metadata: metadata}); err != nil {
 		return fmt.Errorf("restore archive rejected before database access: %w", err)
 	}
 	return nil
@@ -30,27 +29,38 @@ func validateRestoreArchive(ctx context.Context, path string) error {
 
 type archiveReader struct {
 	r       *bufio.Reader
+	scratch [512]byte
 	intSize int
 	err     error
 }
 
-func (r *archiveReader) bytes(n int) []byte {
+// fixed reads small fields into storage reused for the lifetime of the parser.
+func (r *archiveReader) fixed(n int) []byte {
 	if r.err != nil {
 		return nil
 	}
-	b := make([]byte, n)
+	b := r.scratch[:n]
 	_, r.err = io.ReadFull(r.r, b)
 	return b
 }
 
+func (r *archiveReader) skip(n int64) {
+	for n > 0 && r.err == nil {
+		count := int(min(n, int64(r.r.Size())))
+		_, r.err = r.r.Discard(count)
+		n -= int64(count)
+	}
+}
+
 func (r *archiveReader) integer() int64 {
-	b := r.bytes(1 + r.intSize)
+	b := r.fixed(1 + r.intSize)
 	if r.err != nil {
 		return 0
 	}
-	var raw [8]byte
-	copy(raw[:], b[1:])
-	v := binary.LittleEndian.Uint64(raw[:])
+	v := uint64(binary.LittleEndian.Uint32(b[1:]))
+	if r.intSize == 8 {
+		v = binary.LittleEndian.Uint64(b[1:])
+	}
 	if b[0] > 1 || v > 0x7fffffff {
 		r.err = fmt.Errorf("invalid archive integer")
 		return 0
@@ -72,18 +82,19 @@ func (r *archiveReader) field(keep bool) (string, int64) {
 		return "", n
 	}
 	if keep {
-		return string(r.bytes(int(n))), n
+		if n <= int64(len(r.scratch)) {
+			return string(r.fixed(int(n))), n
+		}
+		buf := make([]byte, int(n))
+		_, r.err = io.ReadFull(r.r, buf)
+		return string(buf), n
 	}
-	_, r.err = io.CopyN(io.Discard, r.r, n)
+	r.skip(n)
 	return "", n
 }
 
-func checkArchiveSchema(ctx context.Context, input io.Reader) error {
-	return checkArchive(ctx, input, false)
-}
-
 // Retain only the command prefix, never an entire SQL definition.
-func (r *archiveReader) definitionPrefix() (string, int64) {
+func (r *archiveReader) definitionPrefix(limit int64) (string, int64) {
 	n := r.integer()
 	if r.err != nil || n == -1 {
 		return "", n
@@ -92,16 +103,67 @@ func (r *archiveReader) definitionPrefix() (string, int64) {
 		r.err = fmt.Errorf("invalid archive definition length")
 		return "", n
 	}
-	prefix := r.bytes(int(min(n, 32)))
+	prefix := r.fixed(int(min(n, limit)))
 	if r.err == nil {
-		_, r.err = io.CopyN(io.Discard, r.r, n-int64(len(prefix)))
+		r.skip(n - int64(len(prefix)))
 	}
 	return string(prefix), n
 }
 
-func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) error {
+type extensionTable struct {
+	namespace, name, oid string
+	kind, owner          string
+}
+
+type archiveMetadata struct {
+	database        string
+	layout          *tocLayout
+	proofs          []extensionProof
+	emptyMappings   []string
+	extensions      []string
+	extensionTables []extensionTable
+	encoding        string
+	subscriptions   []string
+	refreshesViews  bool
+}
+
+type archiveChecks struct {
+	database              string
+	rejectUnlogged        bool
+	requireMappingOptions bool
+	metadata              *archiveMetadata
+}
+
+// pg_dump quotes mapping and server identifiers with doubled double quotes.
+// The options list begins after both identifiers, before any option values.
+func hasMappingOptions(prefix string) bool {
+	quoted := false
+	for _, c := range prefix {
+		switch c {
+		case '"':
+			quoted = !quoted
+		case '(':
+			if !quoted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func inspectArchive(ctx context.Context, input io.Reader, checks archiveChecks) error {
+	var layout *tocLayout
+	if checks.metadata != nil {
+		layout = checks.metadata.layout
+	}
+	var counter countedArchive
+	if layout != nil {
+		counter.Reader = input
+		input = &counter
+	}
 	r := &archiveReader{r: bufio.NewReader(input)}
-	header := r.bytes(11)
+	position := func() int64 { return counter.n - int64(r.r.Buffered()) }
+	header := r.fixed(11)
 	if r.err != nil {
 		return r.err
 	}
@@ -115,24 +177,40 @@ func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) err
 		return fmt.Errorf("invalid archive integer/offset size")
 	}
 	if minor >= 15 {
-		r.bytes(1) // Compression algorithm; the TOC itself is never compressed.
+		r.fixed(1) // Compression algorithm; the TOC itself is never compressed.
 	} else {
 		r.integer() // Compression level in older archives.
 	}
 	for range 7 {
 		r.integer() // Creation time.
 	}
-	for range 3 {
-		r.field(false) // Database and producer/server versions.
+	database, _ := r.field(checks.metadata != nil || checks.database != "")
+	if checks.database != "" && database != checks.database {
+		return fmt.Errorf("archive database %q does not match requested name %q", database, checks.database)
+	}
+	if checks.metadata != nil {
+		checks.metadata.database = database
+	}
+	r.field(false) // Producer and server versions.
+	r.field(false)
+	if layout != nil {
+		layout.countAt = position()
+		layout.intSize = r.intSize
+		layout.offsetSize = offsetSize
+		layout.minor = minor
 	}
 	count := r.integer()
+	if layout != nil {
+		layout.count = count
+	}
 	if count < 0 {
 		return fmt.Errorf("invalid archive entry count")
 	}
 	type object struct{ namespace, name string }
 	type dataObject struct {
 		object
-		kind string
+		kind, oid string
+		span      tocSpan
 	}
 	definitions := make(map[object]string)
 	var required []dataObject
@@ -143,20 +221,58 @@ func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) err
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		entryStart := position()
 		id := r.integer()
+		if layout != nil {
+			layout.maxID = max(layout.maxID, id)
+		}
 		if id <= 0 {
 			return fmt.Errorf("invalid archive entry ID")
 		}
-		r.integer()    // Has a data dumper.
-		r.field(false) // Catalog table OID.
-		r.field(false) // Object OID.
+		r.integer()                               // Has a data dumper.
+		r.field(false)                            // Catalog table OID.
+		oid, _ := r.field(checks.metadata != nil) // Source relation OID for TABLE DATA.
 		name, _ := r.field(true)
 		kind, _ := r.field(true)
 		section := r.integer()
-		definitionPrefix, definitionSize := r.definitionPrefix()
+		limit := int64(32)
+		if kind == "ENCODING" && checks.metadata != nil {
+			limit = 128
+		}
+		if kind == "USER MAPPING" && checks.requireMappingOptions {
+			// Two PostgreSQL identifiers (63 bytes each) plus quoting and keywords.
+			limit = 512
+		}
+		definitionAt := position()
+		definitionPrefix, definitionSize := r.definitionPrefix(limit)
+		if kind == "EXTENSION" && layout != nil {
+			if layout.extensionSQL == nil {
+				layout.extensionSQL = make(map[string]tocSpan)
+			}
+			layout.extensionSQL[name] = tocSpan{definitionAt, position()}
+		}
+		if checks.requireMappingOptions && kind == "USER MAPPING" && !hasMappingOptions(definitionPrefix) {
+			if checks.metadata == nil {
+				return fmt.Errorf("cannot verify USER MAPPING without source metadata")
+			}
+			checks.metadata.emptyMappings = append(checks.metadata.emptyMappings, name)
+		}
+		if m := checks.metadata; m != nil {
+			switch kind {
+			case "SUBSCRIPTION":
+				m.subscriptions = append(m.subscriptions, name)
+			case "MATERIALIZED VIEW DATA":
+				m.refreshesViews = true
+			case "ENCODING":
+				raw, ok := strings.CutPrefix(strings.TrimSpace(definitionPrefix), "SET client_encoding = '")
+				if encoding, complete := strings.CutSuffix(raw, "';"); ok && complete {
+					m.encoding = encoding
+				}
+			}
+		}
 		// pg_dump emits these canonical prefixes for UNLOGGED relations. Check
 		// the actual dump as well as the preflight query to cover intervening DDL.
-		if rejectUnlogged && section == 2 &&
+		if checks.rejectUnlogged && section == 2 &&
 			((kind == "TABLE" && strings.HasPrefix(definitionPrefix, "CREATE UNLOGGED TABLE ")) ||
 				(kind == "SEQUENCE" && strings.HasPrefix(definitionPrefix, "CREATE UNLOGGED SEQUENCE "))) {
 			return fmt.Errorf("standby archive contains UNLOGGED definitions with omitted contents; BACKUP_ALLOW_PARTIAL=true is required")
@@ -177,7 +293,13 @@ func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) err
 				break
 			}
 		}
-		r.bytes(1 + offsetSize) // Data offset and its status byte.
+		offsetAt := position()
+		offset := r.fixed(1 + offsetSize)
+		if layout != nil && r.err == nil && offset[0] == 2 { // K_OFFSET_POS_SET
+			var value [8]byte
+			copy(value[:], offset[1:])
+			layout.offsets = append(layout.offsets, tocOffset{offsetAt + 1, binary.LittleEndian.Uint64(value[:])})
+		}
 		key := object{namespace, name}
 		hasData = hasData || section == 3       // SECTION_DATA, including large objects/statistics.
 		if section == 2 && definitionSize > 0 { // SECTION_PRE_DATA
@@ -195,6 +317,9 @@ func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) err
 			}
 			if kind == "EXTENSION" && dropSize > 0 {
 				hasExtension = true
+				if checks.metadata != nil {
+					checks.metadata.extensions = append(checks.metadata.extensions, name)
+				}
 			}
 		}
 		var requiredKind string
@@ -207,7 +332,7 @@ func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) err
 			requiredKind = "MATERIALIZED VIEW"
 		}
 		if requiredKind != "" {
-			required = append(required, dataObject{key, requiredKind})
+			required = append(required, dataObject{key, requiredKind, oid, tocSpan{entryStart, position()}})
 		}
 	}
 	if r.err != nil {
@@ -221,15 +346,21 @@ func checkArchive(ctx context.Context, input io.Reader, rejectUnlogged bool) err
 	}
 	for _, data := range required {
 		got := definitions[data.object]
-		if got == data.kind || (data.kind == "TABLE" && got == "FOREIGN TABLE") {
+		if data.kind == "TABLE" && got == "FOREIGN TABLE" {
+			return fmt.Errorf("WARNING: archive contains foreign table data for %q.%q; skipping database to avoid writing to the external server", data.namespace, data.name)
+		}
+		if got == data.kind {
 			continue
 		}
-		// Extension configuration tables have no separate TABLE definition, and
-		// their TABLE DATA dependencies can refer to omitted table entries.
-		// Their row changes are transactional. SEQUENCE SET is different: require
-		// a matching definition even when an extension is present, since setval on
-		// an existing sequence does not roll back.
-		if data.kind == "TABLE" && hasExtension {
+		// pg_dump omits the definition of an extension configuration table.
+		// Verify its identity against the catalog and guard its restore session.
+		if (data.kind == "TABLE" || (data.kind == "SEQUENCE" && checks.metadata != nil)) && got == "" && hasExtension {
+			if checks.metadata != nil {
+				if layout != nil {
+					layout.spans = append(layout.spans, data.span)
+				}
+				checks.metadata.extensionTables = append(checks.metadata.extensionTables, extensionTable{namespace: data.namespace, name: data.name, oid: data.oid, kind: data.kind})
+			}
 			continue
 		}
 		return fmt.Errorf("archive data for %q.%q has no matching %s definition; data-only or incomplete archives are not supported", data.namespace, data.name, data.kind)

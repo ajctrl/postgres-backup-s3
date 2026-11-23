@@ -78,6 +78,7 @@ case "$command" in
   psql)
     [ "${PGCLIENTENCODING:-}" = UTF8 ] || exit 9
     case "$source" in
+      "SELECT pg_catalog.to_json("*current_database*) echo true; exit 0;;
       *pg_is_in_recovery*)
         [ "${FAKE_SOURCE_FAILURE:-}" != true ] && [ "${FAKE_SOURCE_FAILURE:-}" != "$database" ] || exit 1
         state='{"standby":false,"unlogged":false}'
@@ -92,7 +93,8 @@ case "$command" in
       printf 'partial dump\n'
       exit 1
     fi
-    cat "$FAKE_DUMP_FILE"
+    named="$FAKE_DUMP_FILE-${database#postgresql:///}"
+    if [ -f "$named" ]; then cat "$named"; else cat "$FAKE_DUMP_FILE"; fi
     printf ' %s\n' "$database"
     ;;
   pg_restore)
@@ -144,6 +146,7 @@ type fakeS3 struct {
 	mu            sync.Mutex
 	ready         chan struct{}
 	readyOnce     sync.Once
+	stored        map[string][]byte
 	requests      []request
 	objects       []object
 	versioning    string
@@ -205,7 +208,9 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "POST":
-		if query.Has("uploads") {
+		if query.Has("delete") {
+			io.WriteString(w, "<DeleteResult/>")
+		} else if query.Has("uploads") {
 			io.WriteString(w, `<InitiateMultipartUploadResult><UploadId>stream</UploadId></InitiateMultipartUploadResult>`)
 		} else if query.Has("uploadId") {
 			io.WriteString(w, `<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`)
@@ -246,14 +251,51 @@ func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			NextContinuationToken string   `xml:"NextContinuationToken,omitempty"`
 			Contents              []object `xml:"Contents"`
 		}{Name: "test-bucket", IsTruncated: next != "", NextContinuationToken: next, Contents: matching[start:end]})
+	case "HEAD":
+		for _, obj := range s.objects {
+			if obj.Key == key {
+				modified, err := time.Parse(time.RFC3339, obj.LastModified)
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Last-Modified", modified.UTC().Format(http.TimeFormat))
+				return
+			}
+		}
+		for _, put := range s.calls("PUT") {
+			if put.Key == key {
+				w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
 	case "PUT":
+		if !query.Has("partNumber") {
+			s.mu.Lock()
+			if s.stored == nil {
+				s.stored = make(map[string][]byte)
+			}
+			s.stored[key] = body
+			s.mu.Unlock()
+		}
 		w.Header().Set("ETag", `"test-etag"`)
 		w.WriteHeader(http.StatusOK)
 	case "GET":
 		w.Header().Set("Content-Type", "application/octet-stream")
 		body := s.downloadBody
 		if body == nil {
-			body = restoreArchiveFixture(false)
+			s.mu.Lock()
+			body = s.stored[key]
+			s.mu.Unlock()
+		}
+		if body == nil {
+			name := strings.TrimSuffix(strings.TrimSuffix(filepath.Base(key), ".gpg"), ".dump")
+			if regexp.MustCompile(`^[0-9]{4}-.*-[0-9a-f]{32}$`).MatchString(name) {
+				name = filepath.Base(filepath.Dir(key))
+			}
+			db, _ := url.PathUnescape(name)
+			body = namedArchiveFixture(db, false)
 		}
 		w.Write(body)
 	case "DELETE":
@@ -338,6 +380,22 @@ func (f *fixture) databases(value any) {
 func (f *fixture) command(args ...string) *exec.Cmd {
 	f.t.Helper()
 	f.s3.readyOnce.Do(func() { close(f.s3.ready) })
+	var names []string
+	if b, err := os.ReadFile(f.env["FAKE_DATABASES_FILE"]); err == nil {
+		_ = json.Unmarshal(b, &names)
+	}
+	names = append(names, strings.Split(f.env["POSTGRES_DATABASES"], ",")...)
+	names = append(names, f.env["POSTGRES_DATABASE"])
+	for _, db := range names {
+		db = strings.TrimSpace(db)
+		if db == "" || db == "app" {
+			continue
+		}
+		key := strings.ReplaceAll(url.QueryEscape(db), "+", "%20")
+		if err := os.WriteFile(f.env["FAKE_DUMP_FILE"]+"-"+key, namedArchiveFixture(db, false), 0600); err != nil {
+			f.t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	f.t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, cliBinary, args...)
@@ -447,7 +505,7 @@ func TestBackupSingleDatabaseAndLiteralNames(t *testing.T) {
 			assertEqual(t, f.databaseCalls("pg_dump"), []string{name})
 			calls := f.s3.calls("PUT")
 			assertEqual(t, len(calls), 1)
-			pattern := "^" + regexp.QuoteMeta("backup/"+strings.ReplaceAll(url.QueryEscape(name), "+", "%20")+"/") + `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}-[0-9a-f]{32}\.dump$`
+			pattern := "^" + regexp.QuoteMeta("backup/v2/full/"+strings.ReplaceAll(url.QueryEscape(name), "+", "%20")+"/") + `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}-[0-9a-f]{32}\.dump$`
 			if !regexp.MustCompile(pattern).MatchString(calls[0].Key) {
 				t.Fatalf("unexpected timestamp key: %q", calls[0].Key)
 			}
@@ -517,9 +575,13 @@ func TestUnsetRetentionDoesNotListOrDeleteExistingObjects(t *testing.T) {
 					f.env["BACKUP_KEEP_DAYS"] = ""
 				}
 				f.s3.fail = "list"
-				f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
+				f.s3.objects = []object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
 				f.run(true, "backup")
-				assertEqual(t, len(f.s3.calls("PUT")), 2)
+				wantPuts := 2
+				if mode == "fixed" {
+					wantPuts = 4
+				}
+				assertEqual(t, len(f.s3.calls("PUT")), wantPuts)
 				assertEqual(t, len(f.s3.calls("list")), 0)
 				assertEqual(t, len(f.s3.calls("DELETE")), 0)
 			})
@@ -613,14 +675,20 @@ func TestFixedKeysEncodingEncryptionAndVersionRestore(t *testing.T) {
 				if encrypted {
 					f.env["PASSPHRASE"], suffix = "test-passphrase", ".dump.gpg"
 				}
-				key := "backup/" + tc.directory + suffix
+				key := "backup/v2/full/" + tc.directory + suffix
 				f.run(true, "backup")
-				assertEqual(t, keys(f.s3.calls("PUT")), []string{key})
-				assertEqual(t, f.s3.calls("PUT")[0].IfNoneMatch, "")
+				puts := f.s3.calls("PUT")
+				assertEqual(t, len(puts), 2)
+				dataKey := puts[0].Key
+				assertEqual(t, strings.HasPrefix(dataKey, key+".generations/"), true)
+				assertEqual(t, puts[0].IfNoneMatch, "*")
+				assertEqual(t, puts[1].Key, key)
+				assertEqual(t, puts[1].IfNoneMatch, "")
+				assertEqual(t, puts[1].Payload, "postgres-backup-s3 reference v1\n"+strings.TrimPrefix(dataKey, key+".generations/"))
 				assertEqual(t, len(f.s3.calls("versioning")), 1)
 				f.run(true, "restore", "--version-id", "opaque+/version==")
 				gets := f.s3.calls("GET")
-				assertEqual(t, keys(gets), []string{key})
+				assertEqual(t, keys(gets), []string{key, dataKey})
 				assertEqual(t, gets[0].Query.Get("versionId"), "opaque+/version==")
 				assertEqual(t, f.databaseCalls("pg_restore"), []string{tc.name})
 				assertEqual(t, len(f.s3.calls("versioning")), 1)
@@ -672,15 +740,19 @@ func TestBackupFilenameModeForRun(t *testing.T) {
 					assertEqual(t, strings.Contains(output, "WARNING:"), false)
 				}
 				puts := f.s3.calls("PUT")
+				if fixed {
+					assertEqual(t, len(puts), 4)
+					puts = []request{puts[1], puts[3]}
+				}
 				assertEqual(t, len(puts), 2)
 				for i, db := range []string{"app", "billing"} {
 					put := puts[i]
 					assertEqual(t, strings.Contains(output, "key: "+put.Key+"\n"), true)
 					if fixed {
-						assertEqual(t, put.Key, "backup/"+db+".dump")
+						assertEqual(t, put.Key, "backup/v2/full/"+db+".dump")
 						assertEqual(t, put.IfNoneMatch, "")
 					} else {
-						assertEqual(t, strings.HasPrefix(put.Key, "backup/"+db+"/"), true)
+						assertEqual(t, strings.HasPrefix(put.Key, "backup/v2/full/"+db+"/"), true)
 						assertEqual(t, put.IfNoneMatch, "*")
 					}
 				}
@@ -711,11 +783,14 @@ func TestFailuresContinueOtherDatabasesAndSkipUnsafeRetention(t *testing.T) {
 				assertEqual(t, f.databaseCalls("pg_dump"), []string{"app", "billing"})
 				lists := f.s3.calls("list")
 				assertEqual(t, len(lists), 1)
-				assertEqual(t, lists[0].Query.Get("prefix"), "backup/billing/")
+				assertEqual(t, lists[0].Query.Get("prefix"), "backup/v2/full/billing/")
 				uploads := f.s3.calls("PUT")
 				want := 1
+				if mode == "fixed" {
+					want++
+				}
 				if stage == "upload" {
-					want = 2
+					want++
 				}
 				assertEqual(t, len(uploads), want)
 				if !strings.Contains(uploads[len(uploads)-1].Key, "billing") {
@@ -732,20 +807,29 @@ func TestRetentionOnlyDeletesExpiredExactTimestampKeys(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			f := newFixture(t)
 			f.env["POSTGRES_DATABASE"], f.env["BACKUP_FILENAME_MODE"], f.env["BACKUP_KEEP_DAYS"] = "app", mode, "7"
-			expired := []string{"backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/app/2000-01-01T00:00:01-0123456789abcdef0123456789abcdef.dump.gpg"}
+			expired := []string{"backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/v2/full/app/2000-01-01T00:00:01-0123456789abcdef0123456789abcdef.dump.gpg"}
 			for _, key := range expired {
 				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: old})
 			}
-			f.s3.objects = append(f.s3.objects, object{Key: "backup/app/2000-01-01T00:00:02-0123456789abcdef0123456789abcdef.dump", LastModified: recent})
+			f.s3.objects = append(f.s3.objects, object{Key: "backup/v2/full/app/2000-01-01T00:00:02-0123456789abcdef0123456789abcdef.dump", LastModified: recent})
 			for _, key := range []string{
-				"backup/app.dump", "backup/app.dump.gpg", "backup/app_other_2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump",
-				"backup/app/2000-01-01T00%3A00%3A00/latest.dump", "backup/other/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump",
-				"backup/app/notes.dump", "backup/app/latest.dump", "backup/app_2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump.extra", "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump\n",
+				"backup/v2/full/app.dump", "backup/v2/full/app.dump.gpg", "backup/v2/full/app_other_2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump",
+				"backup/v2/full/app/2000-01-01T00%3A00%3A00/latest.dump", "backup/v2/full/other/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump",
+				"backup/v2/full/app/notes.dump", "backup/v2/full/app/latest.dump", "backup/v2/full/app_2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump.extra", "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump\n",
 			} {
 				f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: old})
 			}
 			f.run(true, "backup")
-			assertEqual(t, keys(f.s3.calls("DELETE")), expired)
+			calls := f.s3.calls("POST")
+			assertEqual(t, len(calls), 1)
+			assertEqual(t, calls[0].Query.Has("delete"), true)
+			var batch struct {
+				Keys []string `xml:"Object>Key"`
+			}
+			if err := xml.Unmarshal([]byte(calls[0].Payload), &batch); err != nil {
+				t.Fatal(err)
+			}
+			assertEqual(t, batch.Keys, expired)
 		})
 	}
 }
@@ -756,7 +840,7 @@ func TestRetentionFailuresReportErrorAndContinue(t *testing.T) {
 			f := newFixture(t)
 			f.env["POSTGRES_DATABASES"], f.env["BACKUP_KEEP_DAYS"] = "app,billing", "7"
 			f.s3.fail = stage
-			f.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
+			f.s3.objects = []object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
 			output := f.run(false, "backup")
 			if !strings.Contains(output, "2 succeeded, 0 failed") {
 				t.Fatalf("incorrect backup summary after retention failure: %s", output)
@@ -775,18 +859,20 @@ func TestPrefixLayouts(t *testing.T) {
 				f := newFixture(t)
 				f.env["POSTGRES_DATABASE"], f.env["S3_PREFIX"], f.env["BACKUP_FILENAME_MODE"] = "app", tc.prefix, mode
 				f.env["BACKUP_KEEP_DAYS"] = "7"
-				oldKey := tc.timestamp + "app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump"
+				oldKey := tc.timestamp + "v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump"
 				f.s3.objects = []object{{Key: oldKey, LastModified: "2000-01-01T00:00:00Z"}}
 				f.run(true, "backup")
-				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.timestamp+"app/")
+				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.timestamp+"v2/full/app/")
 				assertEqual(t, keys(f.s3.calls("DELETE")), []string{oldKey})
 				if mode == "fixed" {
-					key := tc.fixed + "app.dump"
-					assertEqual(t, keys(f.s3.calls("PUT")), []string{key})
+					key := tc.fixed + "v2/full/app.dump"
+					puts := f.s3.calls("PUT")
+					assertEqual(t, len(puts), 2)
+					assertEqual(t, puts[1].Key, key)
 					f.run(true, "restore")
-					assertEqual(t, keys(f.s3.calls("GET")), []string{key})
+					assertEqual(t, keys(f.s3.calls("GET")), []string{key, puts[0].Key})
 				} else {
-					if !strings.HasPrefix(f.s3.calls("PUT")[0].Key, tc.timestamp+"app/") {
+					if !strings.HasPrefix(f.s3.calls("PUT")[0].Key, tc.timestamp+"v2/full/app/") {
 						t.Fatalf("timestamp prefix changed: %v", keys(f.s3.calls("PUT")))
 					}
 					f.run(true, "restore", "2000-01-01T00:00:00-0123456789abcdef0123456789abcdef")
@@ -802,11 +888,11 @@ func TestLatestRestoreExactMatchingAndPagination(t *testing.T) {
 	f.env["POSTGRES_DATABASE"] = "app"
 	f.s3.pageSize = 1000
 	for i := 0; i < 1001; i++ {
-		key := "backup/app/" + time.Date(2020, 1, 1, 0, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05") + "-0123456789abcdef0123456789abcdef.dump"
+		key := "backup/v2/full/app/" + time.Date(2020, 1, 1, 0, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05") + "-0123456789abcdef0123456789abcdef.dump"
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2020-01-01T00:00:00Z"})
 	}
 	want := f.s3.objects[1000].Key
-	for _, key := range []string{"backup/app_extra/2030-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/app_2030-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/app/latest.dump", "backup/app/2025-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump.gpg", "backup/app/2040-01-01T00%3A00%3A00/latest.dump"} {
+	for _, key := range []string{"backup/v2/full/app_extra/2030-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/v2/full/app_2030-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", "backup/v2/full/app/latest.dump", "backup/v2/full/app/2025-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump.gpg", "backup/v2/full/app/2040-01-01T00%3A00%3A00/latest.dump"} {
 		f.s3.objects = append(f.s3.objects, object{Key: key, LastModified: "2000-01-01T00:00:00Z"})
 	}
 	f.run(true, "restore")
@@ -876,7 +962,7 @@ func TestBackupLockCoversDumpUploadAndRetentionAcrossProcesses(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			first := newFixture(t)
 			first.env["POSTGRES_DATABASE"], first.env["BACKUP_KEEP_DAYS"] = "app", "7"
-			first.s3.objects = []object{{Key: "backup/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
+			first.s3.objects = []object{{Key: "backup/v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump", LastModified: "2000-01-01T00:00:00Z"}}
 			entered, release := filepath.Join(first.dir, "entered"), filepath.Join(first.dir, "release")
 			if stage == "dump" {
 				first.env["FAKE_PAUSE_COMMAND"], first.env["FAKE_PAUSE_ENTERED"], first.env["FAKE_PAUSE_RELEASE"] = "pg_dump", entered, release
@@ -1028,6 +1114,73 @@ func waitForFile(t *testing.T, path string, p *backgroundCLI) {
 			t.Fatalf("CLI did not reach paused command\n%s", output)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestScheduledBackupRejectsUnsupportedClientAtStartup(t *testing.T) {
+	f := newFixture(t)
+	f.env["SCHEDULE"], f.env["POSTGRES_DATABASE"] = "@weekly", "app"
+	f.env["PGDUMP_EXTRA_OPTS"], f.env["FAKE_PG_VERSION"] = "--no-statistics", "17.12"
+	output := f.run(false, "run")
+	if !strings.Contains(output, "requires pg_dump 18") || strings.Contains(output, "Scheduling backups") || len(f.s3.calls("")) != 0 {
+		t.Fatalf("unexpected scheduler startup: %s", output)
+	}
+}
+
+func TestPlainRestoreKilledWithAnonymousDownload(t *testing.T) {
+	for _, stage := range []string{"download", "pg_restore"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newFixture(t)
+			f.env["POSTGRES_DATABASE"], f.env["BACKUP_FILENAME_MODE"] = "app", "fixed"
+			entered := filepath.Join(f.dir, "entered")
+			release := filepath.Join(f.dir, "release")
+			if stage == "download" {
+				// Keep a ranged response open after it has supplied plaintext.
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Length", "1048576")
+					w.Header().Set("Content-Range", "bytes 0-1048575/1048576")
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(bytes.Repeat([]byte("x"), 32768))
+					w.(http.Flusher).Flush()
+					if err := os.WriteFile(entered, nil, 0600); err != nil {
+						t.Error(err)
+					}
+					<-r.Context().Done()
+				}))
+				t.Cleanup(server.Close)
+				f.env["S3_ENDPOINT"] = server.URL
+			} else {
+				f.env["FAKE_PAUSE_COMMAND"], f.env["FAKE_PAUSE_ENTERED"], f.env["FAKE_PAUSE_RELEASE"] = "pg_restore", entered, release
+			}
+			p := f.background("restore", "--version-id", "test-version")
+			defer os.WriteFile(release, nil, 0600)
+			waitForFile(t, entered, p)
+			if err := p.cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.wait(t); err == nil {
+				t.Fatal("expected interruption")
+			}
+			f.assertClean()
+			if stage == "pg_restore" {
+				// An orphaned pg_restore shares the operation lock until it exits.
+				if err := os.WriteFile(release, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					cmd := f.command("restore", "--version-id", "test-version")
+					out, err := cmd.CombinedOutput()
+					if err == nil {
+						break
+					}
+					if !bytes.Contains(out, []byte("backup lock")) || time.Now().After(deadline) {
+						t.Fatalf("release: %v %s", err, out)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		})
 	}
 }
 

@@ -17,8 +17,9 @@ type archiveDownloadStore struct {
 	archive []byte
 }
 
-func (s *archiveDownloadStore) Download(_ context.Context, _, _, path string) error {
-	return os.WriteFile(path, s.archive, 0600)
+func (s *archiveDownloadStore) DownloadTo(_ context.Context, _, _ string, file *os.File) error {
+	_, err := file.WriteAt(s.archive, 0)
+	return err
 }
 
 // Exercise configuration, archive validation, and the actual restore command
@@ -118,7 +119,7 @@ CREATE TABLE target_only(id integer);`)
 				"BACKUP_FILENAME_MODE": "fixed", "RESTORE_NO_TABLESPACES": tc.noTablespaces,
 				"RESTORE_NO_TABLE_ACCESS_METHOD": tc.noAccessMethod,
 			}
-			config, err := loadConfig(func(key string) (string, bool) { v, ok := env[key]; return v, ok })
+			config, err := loadConfig("restore", func(key string) (string, bool) { v, ok := env[key]; return v, ok })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -127,7 +128,7 @@ CREATE TABLE target_only(id integer);`)
 			app.lockPath = filepath.Join(dir, "backup.lock")
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
-			err = app.Restore(ctx, nil)
+			err = app.restoreFrom(ctx, nil, "source")
 			if tc.wantMethod == "" {
 				if err == nil || !strings.Contains(err.Error(), "pg_restore failed") || strings.Contains(stderr.String(), "restore_space") {
 					t.Fatalf("missing tablespace must fail without fallback: %v\n%s", err, &stderr)
