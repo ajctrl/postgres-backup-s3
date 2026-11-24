@@ -106,9 +106,9 @@ func TestNamesAndKeys(t *testing.T) {
 			t.Errorf("databaseURI(%q) = %q", name, got)
 		}
 	}
-	for _, tc := range []struct{ prefix, timestampPrefix, fixedPrefix string }{
-		{"backup", "backup/", "backup/"}, {"backup/", "backup//", "backup/"},
-		{"backup//", "backup///", "backup//"}, {"", "/", ""}, {"/", "//", ""},
+	for _, tc := range []struct{ prefix, wantPrefix string }{
+		{"backup", "backup/"}, {"backup/", "backup/"}, {"backup//", "backup/"},
+		{"", ""}, {"/", ""}, {"///", ""}, {"team/db//", "team/db/"},
 	} {
 		date := time.Date(2026, 9, 12, 12, 30, 0, 0, time.FixedZone("plus2", 2*3600))
 		for name, component := range map[string]string{"app": "app", "a/b": "a%2Fb", "a%2Fb": "a%252Fb", ".": "%2E", "..": "%2E%2E"} {
@@ -119,7 +119,7 @@ func TestNamesAndKeys(t *testing.T) {
 					suffix += ".gpg"
 				}
 				got, err := c.backupKey(name, date)
-				if err != nil || !strings.HasPrefix(got, tc.timestampPrefix+"v2/full/"+component+"/2026-09-12T10:30:00-") || !strings.HasSuffix(got, suffix) || !c.isTimestampBackup(name, got) {
+				if err != nil || !strings.HasPrefix(got, tc.wantPrefix+"v2/full/"+component+"/2026-09-12T10:30:00-") || !strings.HasSuffix(got, suffix) || !c.isTimestampBackup(name, got) {
 					t.Errorf("generation key %q/%q: %q, %v", tc.prefix, name, got, err)
 				}
 				second, err := c.backupKey(name, date)
@@ -127,7 +127,7 @@ func TestNamesAndKeys(t *testing.T) {
 					t.Fatalf("same timestamp reused a generation: %q, %v", second, err)
 				}
 				c.FilenameMode = "fixed"
-				if got, err := c.backupKey(name, date); err != nil || got != tc.fixedPrefix+"v2/full/"+component+suffix {
+				if got, err := c.backupKey(name, date); err != nil || got != tc.wantPrefix+"v2/full/"+component+suffix {
 					t.Errorf("fixed key %q/%q: %q, %v", tc.prefix, name, got, err)
 				}
 			}

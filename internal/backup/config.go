@@ -239,23 +239,24 @@ func (c Config) fileType() string {
 	return ".dump"
 }
 
-func (c Config) scope() string {
-	if c.AllowPartial {
-		return "v2/partial/"
-	}
-	return "v2/full/"
-}
-
-func (c Config) timestampPrefix(database string) string {
-	return c.Prefix + "/" + c.scope() + databaseKeyComponent(database) + "/"
-}
-
-func (c Config) fixedKey(database string) string {
-	prefix := strings.TrimSuffix(c.Prefix, "/")
+func (c Config) databaseKeyBase(database string) string {
+	prefix := strings.TrimRight(c.Prefix, "/")
 	if prefix != "" {
 		prefix += "/"
 	}
-	return prefix + c.scope() + databaseKeyComponent(database) + c.fileType()
+	scope := "v2/full/"
+	if c.AllowPartial {
+		scope = "v2/partial/"
+	}
+	return prefix + scope + databaseKeyComponent(database)
+}
+
+func (c Config) timestampPrefix(database string) string {
+	return c.databaseKeyBase(database) + "/"
+}
+
+func (c Config) fixedKey(database string) string {
+	return c.databaseKeyBase(database) + c.fileType()
 }
 
 func databaseKeyComponent(database string) string {

@@ -20,11 +20,22 @@ while IFS=$'\t' read -r number head_sha; do
   if [[ "$behind" == 0 ]]; then continue; fi
   if result=$(gh api --method PUT "$repo/pulls/$number/update-branch" -f expected_head_sha="$head_sha" 2>&1); then
     echo "Updating PR #$number"
-  elif [[ "$result" == *'HTTP 422'* || "$result" == *'HTTP 409'* ]]; then
-    echo "::warning::PR #$number was updated concurrently or has a conflict: $result"
-  else
-    echo "::error::Could not update PR #$number: $result"
-    failed=1
+    continue
   fi
+  if [[ "$result" == *'HTTP 422'* || "$result" == *'HTTP 409'* ]]; then
+    if pr=$(gh api "$repo/pulls/$number"); then
+      reason=$(jq -r --arg sha "$head_sha" '
+        if .state == "closed" then "closed"
+        elif (.head.sha != null and .head.sha != $sha) then "head changed"
+        elif .mergeable == false then "merge conflict"
+        else empty end' <<< "$pr")
+      if [[ -n "$reason" ]]; then
+        echo "::warning::Skipping PR #$number: $reason"
+        continue
+      fi
+    fi
+  fi
+  echo "::error::Could not update PR #$number: $result"
+  failed=1
 done <<< "$rows"
 exit "$failed"

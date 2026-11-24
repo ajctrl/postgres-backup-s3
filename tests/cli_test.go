@@ -851,28 +851,29 @@ func TestRetentionFailuresReportErrorAndContinue(t *testing.T) {
 }
 
 func TestPrefixLayouts(t *testing.T) {
-	for _, tc := range []struct{ prefix, timestamp, fixed string }{
-		{"backup/", "backup//", "backup/"}, {"backup//", "backup///", "backup//"}, {"", "/", ""}, {"/", "//", ""},
+	for _, tc := range []struct{ prefix, wantPrefix string }{
+		{"backup", "backup/"}, {"backup/", "backup/"}, {"backup//", "backup/"},
+		{"", ""}, {"/", ""}, {"///", ""}, {"team/db//", "team/db/"},
 	} {
 		for _, mode := range []string{"timestamp", "fixed"} {
 			t.Run(fmt.Sprintf("%q/%s", tc.prefix, mode), func(t *testing.T) {
 				f := newFixture(t)
 				f.env["POSTGRES_DATABASE"], f.env["S3_PREFIX"], f.env["BACKUP_FILENAME_MODE"] = "app", tc.prefix, mode
 				f.env["BACKUP_KEEP_DAYS"] = "7"
-				oldKey := tc.timestamp + "v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump"
+				oldKey := tc.wantPrefix + "v2/full/app/2000-01-01T00:00:00-0123456789abcdef0123456789abcdef.dump"
 				f.s3.objects = []object{{Key: oldKey, LastModified: "2000-01-01T00:00:00Z"}}
 				f.run(true, "backup")
-				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.timestamp+"v2/full/app/")
+				assertEqual(t, f.s3.calls("list")[0].Query.Get("prefix"), tc.wantPrefix+"v2/full/app/")
 				assertEqual(t, keys(f.s3.calls("DELETE")), []string{oldKey})
 				if mode == "fixed" {
-					key := tc.fixed + "v2/full/app.dump"
+					key := tc.wantPrefix + "v2/full/app.dump"
 					puts := f.s3.calls("PUT")
 					assertEqual(t, len(puts), 2)
 					assertEqual(t, puts[1].Key, key)
 					f.run(true, "restore")
 					assertEqual(t, keys(f.s3.calls("GET")), []string{key, puts[0].Key})
 				} else {
-					if !strings.HasPrefix(f.s3.calls("PUT")[0].Key, tc.timestamp+"v2/full/app/") {
+					if !strings.HasPrefix(f.s3.calls("PUT")[0].Key, tc.wantPrefix+"v2/full/app/") {
 						t.Fatalf("timestamp prefix changed: %v", keys(f.s3.calls("PUT")))
 					}
 					f.run(true, "restore", "2000-01-01T00:00:00-0123456789abcdef0123456789abcdef")

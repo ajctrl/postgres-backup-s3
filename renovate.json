@@ -56,7 +56,7 @@
       "matchStrings": ["ARG GO_VERSION='(?<currentValue>[0-9.]+)'", "`GO_VERSION` [|] `(?<currentValue>[0-9.]+)`"],
       "datasourceTemplate": "docker",
       "depNameTemplate": "golang",
-      "extractVersionTemplate": "^(?<version>[0-9]+[.][0-9]+)-alpine$",
+      "extractVersionTemplate": "^(?<version>[0-9]+[.][0-9]+[.][0-9]+)-alpine$",
       "versioningTemplate": "docker"
     },
     {
