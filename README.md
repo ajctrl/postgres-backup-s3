@@ -511,7 +511,7 @@ PostgreSQL 12–16 images are no longer built, tested or updated. Previously pub
 | `S3_TEST_IMAGE` | Silo distroless image pinned by digest in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's S3 fixture; overrides must support `server /data` and the same credential variables. |
 | `ALPINE_VERSION` | `3.23` | Docker **build argument**, not a runtime environment variable. Selects the runtime base OS; does not select the PostgreSQL client version. |
 | `POSTGRES_VERSION` | `18` | Docker **build argument**, not a runtime environment variable. Selects client major `17` or `18`. |
-| `GO_VERSION` | `1.26` | Docker **build argument** selecting the builder's Go version. |
+| `GO_VERSION` | `1.26.11` | Docker **build argument** selecting the builder's Go version. CI uses the default from the Dockerfile for tests and vet. |
 | `BUILDPLATFORM`, `TARGETOS`, `TARGETARCH` | Supplied by Docker BuildKit | Build-platform inputs; select target architectures with `docker buildx build --platform`. |
 
 ### Repository Compose fixture

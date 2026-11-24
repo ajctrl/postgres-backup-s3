@@ -8,17 +8,32 @@ on:
 permissions:
   contents: read
 
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      go-version: ${{ steps.toolchain.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Read the Go compiler version from the Dockerfile
+        id: toolchain
+        run: |
+          version=$(sed -nE "s/^ARG GO_VERSION='([0-9]+\.[0-9]+\.[0-9]+)'$/\1/p" Dockerfile)
+          if [[ -z "$version" || "$version" == *$'\n'* ]]; then
+            echo "::error::Expected one GO_VERSION pin in Dockerfile"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ steps.toolchain.outputs.version }}
           cache: true
 
       - name: Run tests with the race detector
@@ -48,7 +63,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ needs.test.outputs.go-version }}
           cache: true
 
       - name: Build the integration image
