@@ -488,6 +488,10 @@ go build -o /tmp/postgres-backup-s3 ./cmd/postgres-backup-s3
 
 The multistage build produces a stripped, static Go executable. The compiler and module cache stay in the build stage. The default runtime uses Alpine 3.23 and PostgreSQL client 18.
 
+Both images default to the `backup` user (UID/GID `65532:65532`) with home `/home/backup`. Mount home-relative AWS and PostgreSQL credentials under the runtime user's home and make them readable by that user. If you mount a GnuPG home, give that user write access.
+
+If you persist `/tmp/postgres-backup-s3-lock`, check the ownership of the directory and any existing `operation.lock` file against the UID/GID the upgraded container will use. Account for any Compose `user:` or `docker run --user` override. If ownership differs, stop all containers sharing the lock, update ownership, then restart them. If it already matches, skip the ownership change. Keep the directory mode at `0700` and the file mode at `0600`. Containers with a fresh `/tmp` create their own lock automatically.
+
 ```sh
 docker build -t postgres-backup-s3:local .
 docker buildx build --platform linux/amd64,linux/arm64 --build-arg POSTGRES_VERSION=17 .
