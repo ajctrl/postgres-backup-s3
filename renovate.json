@@ -1,0 +1,87 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "automerge": true,
+  "platformAutomerge": true,
+  "rebaseWhen": "behind-base-branch",
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "The custom managers update the version arguments used in the FROM instructions",
+      "matchManagers": ["dockerfile"],
+      "matchDepNames": ["golang", "alpine"],
+      "enabled": false
+    },
+    {
+      "matchDepNames": ["go", "golang"],
+      "groupName": "Go toolchain"
+    },
+    {
+      "matchPackageNames": ["github.com/aws/aws-sdk-go-v2", "github.com/aws/aws-sdk-go-v2/**", "github.com/aws/smithy-go"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "AWS SDK for Go"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["postgres"],
+      "matchCurrentVersion": "/^17[.]/",
+      "allowedVersions": "/^17[.][0-9]+$/",
+      "groupName": "PostgreSQL 17"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["postgres"],
+      "matchCurrentVersion": "/^18[.]/",
+      "allowedVersions": "/^18[.][0-9]+$/",
+      "groupName": "PostgreSQL 18"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^Dockerfile$/", "/^README[.]md$/"],
+      "matchStrings": ["ARG GO_VERSION='(?<currentValue>[0-9.]+)'", "`GO_VERSION` [|] `(?<currentValue>[0-9.]+)`"],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "golang",
+      "extractVersionTemplate": "^(?<version>[0-9]+[.][0-9]+)-alpine$",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^Dockerfile$/", "/^README[.]md$/"],
+      "matchStrings": ["ARG ALPINE_VERSION='(?<currentValue>[0-9.]+)'", "Alpine (?<currentValue>[0-9]+[.][0-9]+)", "`(?:ALPINE_VERSION|postgresql[0-9]+-client)` [|] `(?<currentValue>[0-9.]+)`"],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "alpine",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^[.]github/workflows/build-and-push-images[.]yml$/", "/^tests/integration/docker_test[.]go$/"],
+      "matchStrings": ["test_image: postgres:(?<currentValue>[0-9.]+)", "\"POSTGRES_TEST_IMAGE\", \"postgres:(?<currentValue>[0-9.]+)\""],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "postgres",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^tests/integration/docker_test[.]go$/"],
+      "matchStrings": ["docker.io/pgsty/silo:(?<currentValue>RELEASE[.][0-9TZ-]+-distroless)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "pgsty/silo",
+      "versioningTemplate": "regex:^RELEASE[.](?<major>[0-9]{4})-(?<minor>[0-9]{2})-(?<patch>[0-9]{2})T(?<build>[0-9]{2})-(?<revision>[0-9]{2})-[0-9]{2}Z-distroless$"
+    }
+  ]
+}

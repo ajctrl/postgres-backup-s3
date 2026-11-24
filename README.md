@@ -434,11 +434,15 @@ If either credential is missing, Docker Hub login and publishing are skipped. Co
 | `GITHUB_REPOSITORY`, `GITHUB_OUTPUT` | Built-in Actions environment variables | Supplied automatically for image naming and step outputs; no manual configuration. |
 | `POSTGRES_VERSION`, `DOCKERHUB_ENABLED` | Internal step environment variables | Computed by the workflow from its matrix, event and secrets; not user-configurable repository settings. |
 
-There are no required repository **Variables** entries. Only the publishing job receives `packages: write` for its automatic `GITHUB_TOKEN`.
+### Automated dependency updates
+
+Renovate checks daily at 03:17 UTC and can also be run manually from Actions. Install the Renovate GitHub App on this repository and configure the Actions variable `RENOVATE_APP_CLIENT_ID` and secret `RENOVATE_APP_PRIVATE_KEY`. A push to `master` refreshes open update PRs from that App.
+
+Renovate tracks Go, Go modules, Alpine, Actions, the Renovate runtime, and the database and S3 test images. PostgreSQL 17 and 18 receive updates within their own series. The published image tags remain `17` and `18`. Enable repository auto-merge and require up-to-date PRs to pass the unit, integration and multi-platform build jobs for both series before merging.
 
 ## Development
 
-Use Go 1.26 or later on Linux. The race detector requires a C compiler; production builds disable CGO.
+Use the Go version specified in `go.mod` or later on Linux. The race detector requires a C compiler; production builds disable CGO.
 
 ### Tests
 
@@ -460,7 +464,7 @@ These tests create and remove private local clusters. Restore-placement checks u
 
 The local PostgreSQL tests also verify that large-object-only archives are rejected before modifying existing large objects, while full dumps containing ordinary object definitions and large objects pass structural validation. They start a private streaming standby to exercise UNLOGGED rejection and explicit permission, verify UTF-8 discovery under a LATIN1 client environment, and check that a real USER MAPPING restore failure does not disclose its password. The restore tests require `pg_basebackup` and the `postgres_fdw` extension in addition to server/client tools. Pipeline tests cover TOC validation without losing buffered/read-ahead bytes and prevent publication/retention after ambiguous archives. Retention tests cover host clocks ahead/behind S3, missing/invalid server dates, pagination, and protection of the newly published key.
 
-CI compiles the native PostgreSQL test binary and runs it as the unprivileged `postgres` user in both `postgres:17` and `postgres:18` containers. `PG_TEST_REQUIRED=true` makes unavailable tools, root execution, or a missing required extension fail the tests instead of skipping them. These tests are required before image publication. They also verify role changes between preflight and dump, including failure when the verified role disappears. HTTP regression tests cover rollback between SDK attempts for single-request publication, multipart completion, and retention deletion, plus successful retries without rollback.
+CI compiles the native PostgreSQL test binary and runs it as the unprivileged `postgres` user in containers for both supported PostgreSQL series. `PG_TEST_REQUIRED=true` makes unavailable tools, root execution, or a missing required extension fail the tests instead of skipping them. These tests are required before image publication. They also verify role changes between preflight and dump, including failure when the verified role disappears. HTTP regression tests cover rollback between SDK attempts for single-request publication, multipart completion, and retention deletion, plus successful retries without rollback.
 
 Native tests also install attacker-owned function/aggregate overloads in `public`, verify that source checks never execute them as the backup user, and ensure discovery cannot omit a database through those overloads. They cover the default search path, role/database defaults and `PGOPTIONS`, and check that unrelated session options remain effective.
 
@@ -473,7 +477,7 @@ go test -count=1 -tags=integration -v -timeout=15m ./tests/integration
 
 The integration suite creates and removes disposable containers and a network. It checks plaintext restore, encrypted fixed-name version restore, repeated backups with a surviving GPG agent, and a multipart encrypted backup with an unwritable temporary directory. The latter restore checks row count and a checksum of all values. Tests use isolated credentials and do not contact AWS.
 
-The S3 fixture uses [Silo's distroless image](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z), pinned to the release's multi-platform digest. It starts with `server /data` and retains the `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` environment variables supported by Silo. Readiness and bucket setup use the test's AWS SDK client, so no shell, `curl`, or `mc` is needed inside the Silo container.
+The S3 fixture uses [Silo's distroless image](https://github.com/pgsty/silo/releases), pinned to the release's multi-platform digest. It starts with `server /data` and retains the `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` environment variables supported by Silo. Readiness and bucket setup use the test's AWS SDK client, so no shell, `curl`, or `mc` is needed inside the Silo container.
 
 ### Local executable
 
@@ -507,7 +511,7 @@ PostgreSQL 12–16 images are no longer built, tested or updated. Previously pub
 | Variable / argument | Default | Scope |
 | --- | --- | --- |
 | `BACKUP_TEST_IMAGE` | `postgres-backup-s3:go-migration` | Environment variable for the Docker integration test. |
-| `POSTGRES_TEST_IMAGE` | `postgres:18` | Environment variable for the Docker integration test's PostgreSQL image; match the backup image's client major version. |
+| `POSTGRES_TEST_IMAGE` | PostgreSQL 18 image pinned in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's PostgreSQL image; match the backup image's client major version. |
 | `S3_TEST_IMAGE` | Silo distroless image pinned by digest in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's S3 fixture; overrides must support `server /data` and the same credential variables. |
 | `ALPINE_VERSION` | `3.23` | Docker **build argument**, not a runtime environment variable. Selects the runtime base OS; does not select the PostgreSQL client version. |
 | `POSTGRES_VERSION` | `18` | Docker **build argument**, not a runtime environment variable. Selects client major `17` or `18`. |

@@ -25,7 +25,7 @@ import (
 )
 
 // Pin the distroless multi-platform image from the official Silo release.
-// https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z
+// https://github.com/pgsty/silo/releases
 const defaultS3TestImage = "docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z-distroless@sha256:472f59c7be537571f0f9a2ee6b8fe033a220939d521255bd4bf5339e53db7218"
 
 // TestDevelopmentCompose checks interpolation without starting services or using
@@ -98,7 +98,7 @@ func TestDockerBackupRestore(t *testing.T) {
 	docker(t, ctx, "run", "-d", "--name", postgres, "--network", name, "--network-alias", "postgres",
 		"-p", "127.0.0.1::9000",
 		"-e", "POSTGRES_USER=integration", "-e", "POSTGRES_PASSWORD=integration-password", "-e", "POSTGRES_DB=app",
-		envOr("POSTGRES_TEST_IMAGE", "postgres:18"))
+		envOr("POSTGRES_TEST_IMAGE", "postgres:18.7"))
 	// Sharing one isolated network namespace also works on Docker hosts that
 	// disable communication between containers on a bridge network.
 	// Silo retains MINIO_* settings; its distroless entrypoint runs the server
@@ -348,7 +348,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 	})
 	t.Run("fixed_encrypted_versions", func(t *testing.T) {
-		env := map[string]string{"S3_PREFIX": "fixed/", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
+		env := map[string]string{"S3_PREFIX": "fixed", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
 		key := "fixed/v2/full/app.dump.gpg"
 		version := func() string {
 			t.Helper()
