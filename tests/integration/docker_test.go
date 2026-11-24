@@ -85,7 +85,9 @@ func TestDockerBackupRestore(t *testing.T) {
 	}
 	docker(t, ctx, "info", "--format", "{{.ServerVersion}}")
 	image := envOr("BACKUP_TEST_IMAGE", "postgres-backup-s3:go-migration")
-	docker(t, ctx, "image", "inspect", image)
+	if user := strings.TrimSpace(docker(t, ctx, "image", "inspect", "--format", "{{.Config.User}}", image)); user != "65532:65532" {
+		t.Fatalf("backup image runs as %q, want 65532:65532", user)
+	}
 
 	name := fmt.Sprintf("pgs3-integration-%d", time.Now().UnixNano())
 	docker(t, ctx, "network", "create", name)

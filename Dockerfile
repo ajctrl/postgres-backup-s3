@@ -48,4 +48,6 @@ ENV BACKUP_ALLOW_UNVERSIONED_OVERWRITE='false'
 
 COPY src/run.sh src/backup.sh src/restore.sh /
 
+RUN addgroup -g 65532 backup && adduser -D -u 65532 -G backup -h /home/backup backup
+USER 65532:65532
 CMD ["postgres-backup-s3", "run"]
