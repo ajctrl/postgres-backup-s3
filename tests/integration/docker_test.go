@@ -189,9 +189,7 @@ func TestDockerBackupRestore(t *testing.T) {
 	}
 
 	if !t.Run("timestamp_plaintext", func(t *testing.T) {
-		// Leading/repeated-slash S3 keys are covered by the unit/HTTP tests;
-		// this provider fixture uses a prefix without empty path components.
-		env := map[string]string{"S3_PREFIX": "timestamp"}
+		env := map[string]string{"S3_PREFIX": "timestamp//"}
 		// Exercise the default CMD as well as the legacy restore wrapper.
 		runBackupImage(t, env)
 		objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("timestamp/v2/full/app/")})
@@ -348,7 +346,7 @@ func TestDockerBackupRestore(t *testing.T) {
 		}
 	})
 	t.Run("fixed_encrypted_versions", func(t *testing.T) {
-		env := map[string]string{"S3_PREFIX": "fixed", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
+		env := map[string]string{"S3_PREFIX": "fixed/", "BACKUP_FILENAME_MODE": "fixed", "PASSPHRASE": "integration encryption passphrase"}
 		key := "fixed/v2/full/app.dump.gpg"
 		version := func() string {
 			t.Helper()

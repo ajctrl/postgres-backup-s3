@@ -250,13 +250,9 @@ For example, `backup/v2/full/app.dump` contains a small text reference. The dump
 
 If bucket versioning stops during a run, replacing the reference preserves the previous generation payload. An interrupted reference update can leave an unreferenced generation. For external tools that fetch the dump directly, read the identifier on the second line of the reference and download its generation object. To recover a retained payload whose reference version has expired, copy that payload to a separate restore prefix under a valid timestamped generation key for the original database, then restore the explicit generation from that prefix.
 
-Prefix separator examples:
+Both filename modes strip trailing slashes from `S3_PREFIX`. For example, `backup`, `backup/` and `backup//` all put full backups under `backup/v2/full/`. An empty or slash-only prefix puts them directly under `v2/full/` at the bucket root. Restore and retention search these same paths.
 
-| `S3_PREFIX` | Timestamp example | Fixed example |
-| --- | --- | --- |
-| `backup` | `backup/v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/v2/full/app.dump` |
-| `backup/` | `backup//v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `backup/v2/full/app.dump` |
-| Empty | `/v2/full/app/2026-09-12T10:00:00-0123456789abcdef0123456789abcdef.dump` | `v2/full/app.dump` |
+After upgrading, backups stored under older paths such as `backup//v2/full/` or `/v2/full/` remain at their original S3 keys. Take a new backup to make it available under the normalized prefix.
 
 In fixed mode with `BACKUP_ALLOW_PARTIAL=false`, each run calls `GetBucketVersioning` before the first dump and applies the result to every selected database. Custom S3 endpoints, including IDrive e2, use the same API. Timestamp mode skips this check.
 
@@ -353,7 +349,7 @@ A backup requires `POSTGRES_DATABASE`, `POSTGRES_DATABASES`, or `POSTGRES_BACKUP
 | --- | --- | --- |
 | `S3_BUCKET` | Unset | Required bucket name for backup and restore. |
 | `S3_REGION` | `us-west-1` | Region used by the application. Takes precedence over AWS region environment variables and profile settings. |
-| `S3_PREFIX` | `backup` | Object-key prefix. An explicitly empty value is preserved; timestamp keys then start with `/`. Trailing slashes are preserved according to the [filename-mode rules](#filenames-and-versioning). |
+| `S3_PREFIX` | `backup` | Object-key prefix. Both filename modes strip trailing slashes. An empty or slash-only value starts keys at the bucket root. See [filenames and versioning](#filenames-and-versioning). |
 | `S3_ENDPOINT` | Unset | Custom `http://` or `https://` S3 endpoint. Uses path-style addressing. Do not include URL credentials, a query or a fragment. Takes precedence over SDK endpoint settings. |
 | `S3_ACCESS_KEY_ID` | Unset | Access key for an explicit S3 credential pair. |
 | `S3_SECRET_ACCESS_KEY` | Unset | Secret key for the same explicit S3 credential pair. |
