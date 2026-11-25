@@ -27,7 +27,7 @@ jobs:
           private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
       - uses: renovatebot/github-action@ebcbb513d07ead4d9c0c2139064301db05e84a3e # v46.3.15
         with:
-          renovate-image: ghcr.io/renovatebot/renovate:44@sha256:65138147e008b4c48993052bf041dc907e4044b3912543a804e0ec91ae78b87d
+          renovate-image: ghcr.io/renovatebot/renovate:44@sha256:2d5cd4c778b9a2c36623302ceec231a813d8eed77cea19da13b73dd4e8e92e54
           token: ${{ steps.app-token.outputs.token }}
         env:
           RENOVATE_REPOSITORIES: '["${{ github.repository }}"]'
