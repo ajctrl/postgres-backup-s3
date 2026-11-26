@@ -17,7 +17,7 @@ The image combines a Go executable, AWS SDK for Go v2, PostgreSQL client tools a
 
 Use an existing PostgreSQL database and S3 bucket. The database must be reachable from the backup container, and the configured user must be able to read the selected database.
 
-Images support PostgreSQL major-version tags `17` and `18` on `linux/amd64` and `linux/arm64`. Both use Alpine 3.23. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:18`; for a fork, use `ghcr.io/<owner>/<repository>:18` in lowercase after [publishing its images](#publishing-images).
+Images support PostgreSQL major-version tags `17` and `18` on `linux/amd64` and `linux/arm64`. Both use Alpine 3.24. Select the tag matching your PostgreSQL major version. This example uses `ghcr.io/ajctrl/postgres-backup-s3:18`; for a fork, use `ghcr.io/<owner>/<repository>:18` in lowercase after [publishing its images](#publishing-images).
 
 Create a `compose.yaml` for the backup service. Replace the example connection and bucket values. This example takes AWS access keys and an optional encryption passphrase from your shell or a `.env` file next to `compose.yaml`:
 
@@ -486,7 +486,7 @@ go build -o /tmp/postgres-backup-s3 ./cmd/postgres-backup-s3
 
 ### Docker builds
 
-The multistage build produces a stripped, static Go executable. The compiler and module cache stay in the build stage. The default runtime uses Alpine 3.23 and PostgreSQL client 18.
+The multistage build produces a stripped, static Go executable. The compiler and module cache stay in the build stage. The default runtime uses Alpine 3.24 and PostgreSQL client 18.
 
 Both images default to the `backup` user (UID/GID `65532:65532`) with home `/home/backup`. Mount home-relative AWS and PostgreSQL credentials under the runtime user's home and make them readable by that user. If you mount a GnuPG home, give that user write access.
 
@@ -501,10 +501,10 @@ docker buildx build --platform linux/amd64,linux/arm64 --build-arg POSTGRES_VERS
 
 | PostgreSQL tag | Client package | Alpine version |
 | --- | --- | --- |
-| `17` | `postgresql17-client` | `3.23` |
-| `18` | `postgresql18-client` | `3.23` |
+| `17` | `postgresql17-client` | `3.24` |
+| `18` | `postgresql18-client` | `3.24` |
 
-PostgreSQL 12–16 images are no longer built, tested or updated. Previously published tags may remain in registries, but are unsupported. Both supported images install `gpg` and `gpg-agent` from Alpine 3.23; see [Alpine's support table](https://alpinelinux.org/releases/).
+PostgreSQL 12–16 images are no longer built, tested or updated. Previously published tags may remain in registries, but are unsupported. Both supported images install `gpg` and `gpg-agent` from Alpine 3.24; see [Alpine's support table](https://alpinelinux.org/releases/).
 
 ### Development settings
 
@@ -513,14 +513,14 @@ PostgreSQL 12–16 images are no longer built, tested or updated. Previously pub
 | `BACKUP_TEST_IMAGE` | `postgres-backup-s3:go-migration` | Environment variable for the Docker integration test. |
 | `POSTGRES_TEST_IMAGE` | PostgreSQL 18 image pinned in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's PostgreSQL image; match the backup image's client major version. |
 | `S3_TEST_IMAGE` | Silo distroless image pinned by digest in `tests/integration/docker_test.go` | Environment variable for the Docker integration test's S3 fixture; overrides must support `server /data` and the same credential variables. |
-| `ALPINE_VERSION` | `3.23` | Docker **build argument**, not a runtime environment variable. Selects the runtime base OS; does not select the PostgreSQL client version. |
+| `ALPINE_VERSION` | `3.24` | Docker **build argument**, not a runtime environment variable. Selects the runtime base OS; does not select the PostgreSQL client version. |
 | `POSTGRES_VERSION` | `18` | Docker **build argument**, not a runtime environment variable. Selects client major `17` or `18`. |
 | `GO_VERSION` | `1.26.11` | Docker **build argument** selecting the builder's Go version. CI uses the default from the Dockerfile for tests and vet. |
 | `BUILDPLATFORM`, `TARGETOS`, `TARGETARCH` | Supplied by Docker BuildKit | Build-platform inputs; select target architectures with `docker buildx build --platform`. |
 
 ### Repository Compose fixture
 
-The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 18 backup image on Alpine 3.23 and starts a PostgreSQL 18 development server. It requires a nonempty `PASSPHRASE` before Compose starts the services, along with an S3 bucket and credentials.
+The included [docker-compose.yaml](docker-compose.yaml) builds a PostgreSQL 18 backup image on Alpine 3.24 and starts a PostgreSQL 18 development server. It requires a nonempty `PASSPHRASE` before Compose starts the services, along with an S3 bucket and credentials.
 
 ```sh
 cp template.env .env
